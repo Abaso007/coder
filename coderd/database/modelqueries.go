@@ -76,6 +76,7 @@ func (q *sqlQuerier) GetAuthorizedTemplates(ctx context.Context, arg GetTemplate
 		arg.Deleted,
 		arg.OrganizationID,
 		arg.ExactName,
+		arg.FuzzyName,
 		pq.Array(arg.IDs),
 		arg.Deprecated,
 	)
@@ -361,6 +362,7 @@ func (q *sqlQuerier) GetAuthorizedUsers(ctx context.Context, arg GetUsersParams,
 			&i.QuietHoursSchedule,
 			&i.ThemePreference,
 			&i.Name,
+			&i.GithubComUserID,
 			&i.Count,
 		); err != nil {
 			return nil, err
