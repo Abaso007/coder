@@ -22,7 +22,10 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbmem"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
+	"github.com/coder/coder/v2/coderd/idpsync"
+	"github.com/coder/coder/v2/coderd/runtimeconfig"
 	"github.com/coder/coder/v2/coderd/telemetry"
+	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/testutil"
 )
 
@@ -40,26 +43,41 @@ func TestTelemetry(t *testing.T) {
 		db := dbmem.New()
 
 		ctx := testutil.Context(t, testutil.WaitMedium)
+
+		org, err := db.GetDefaultOrganization(ctx)
+		require.NoError(t, err)
+
 		_, _ = dbgen.APIKey(t, db, database.APIKey{})
 		_ = dbgen.ProvisionerJob(t, db, nil, database.ProvisionerJob{
-			Provisioner:   database.ProvisionerTypeTerraform,
-			StorageMethod: database.ProvisionerStorageMethodFile,
-			Type:          database.ProvisionerJobTypeTemplateVersionDryRun,
+			Provisioner:    database.ProvisionerTypeTerraform,
+			StorageMethod:  database.ProvisionerStorageMethodFile,
+			Type:           database.ProvisionerJobTypeTemplateVersionDryRun,
+			OrganizationID: org.ID,
 		})
 		_ = dbgen.Template(t, db, database.Template{
-			Provisioner: database.ProvisionerTypeTerraform,
+			Provisioner:    database.ProvisionerTypeTerraform,
+			OrganizationID: org.ID,
 		})
 		sourceExampleID := uuid.NewString()
 		_ = dbgen.TemplateVersion(t, db, database.TemplateVersion{
 			SourceExampleID: sql.NullString{String: sourceExampleID, Valid: true},
+			OrganizationID:  org.ID,
 		})
-		_ = dbgen.TemplateVersion(t, db, database.TemplateVersion{})
+		_ = dbgen.TemplateVersion(t, db, database.TemplateVersion{
+			OrganizationID: org.ID,
+		})
 		user := dbgen.User(t, db, database.User{})
-		_ = dbgen.Workspace(t, db, database.WorkspaceTable{})
+		_ = dbgen.Workspace(t, db, database.WorkspaceTable{
+			OrganizationID: org.ID,
+		})
 		_ = dbgen.WorkspaceApp(t, db, database.WorkspaceApp{
 			SharingLevel: database.AppSharingLevelOwner,
 			Health:       database.WorkspaceAppHealthDisabled,
 			OpenIn:       database.WorkspaceAppOpenInSlimWindow,
+		})
+		_ = dbgen.TelemetryItem(t, db, database.TelemetryItem{
+			Key:   string(telemetry.TelemetryItemKeyHTMLFirstServedAt),
+			Value: time.Now().Format(time.RFC3339),
 		})
 		group := dbgen.Group(t, db, database.Group{})
 		_ = dbgen.GroupMember(t, db, database.GroupMemberTable{UserID: user.ID, GroupID: group.ID})
@@ -112,7 +130,8 @@ func TestTelemetry(t *testing.T) {
 		require.Len(t, snapshot.WorkspaceAgentStats, 1)
 		require.Len(t, snapshot.WorkspaceProxies, 1)
 		require.Len(t, snapshot.WorkspaceModules, 1)
-
+		require.Len(t, snapshot.Organizations, 1)
+		require.Len(t, snapshot.TelemetryItems, 1)
 		wsa := snapshot.WorkspaceAgents[0]
 		require.Len(t, wsa.Subsystems, 2)
 		require.Equal(t, string(database.WorkspaceAgentSubsystemEnvbox), wsa.Subsystems[0])
@@ -128,6 +147,19 @@ func TestTelemetry(t *testing.T) {
 		})
 		require.Equal(t, tvs[0].SourceExampleID, &sourceExampleID)
 		require.Nil(t, tvs[1].SourceExampleID)
+
+		for _, entity := range snapshot.Workspaces {
+			require.Equal(t, entity.OrganizationID, org.ID)
+		}
+		for _, entity := range snapshot.ProvisionerJobs {
+			require.Equal(t, entity.OrganizationID, org.ID)
+		}
+		for _, entity := range snapshot.TemplateVersions {
+			require.Equal(t, entity.OrganizationID, org.ID)
+		}
+		for _, entity := range snapshot.Templates {
+			require.Equal(t, entity.OrganizationID, org.ID)
+		}
 	})
 	t.Run("HashedEmail", func(t *testing.T) {
 		t.Parallel()
@@ -243,6 +275,41 @@ func TestTelemetry(t *testing.T) {
 			require.Equal(t, c.want, telemetry.GetModuleSourceType(c.source))
 		}
 	})
+	t.Run("IDPOrgSync", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t, testutil.WaitMedium)
+		db, _ := dbtestutil.NewDB(t)
+
+		// 1. No org sync settings
+		deployment, _ := collectSnapshot(t, db, nil)
+		require.False(t, *deployment.IDPOrgSync)
+
+		// 2. Org sync settings set in server flags
+		deployment, _ = collectSnapshot(t, db, func(opts telemetry.Options) telemetry.Options {
+			opts.DeploymentConfig = &codersdk.DeploymentValues{
+				OIDC: codersdk.OIDCConfig{
+					OrganizationField: "organizations",
+				},
+			}
+			return opts
+		})
+		require.True(t, *deployment.IDPOrgSync)
+
+		// 3. Org sync settings set in runtime config
+		org, err := db.GetDefaultOrganization(ctx)
+		require.NoError(t, err)
+		sync := idpsync.NewAGPLSync(testutil.Logger(t), runtimeconfig.NewManager(), idpsync.DeploymentSyncSettings{})
+		err = sync.UpdateOrganizationSyncSettings(ctx, db, idpsync.OrganizationSyncSettings{
+			Field: "organizations",
+			Mapping: map[string][]uuid.UUID{
+				"first": {org.ID},
+			},
+			AssignDefault: true,
+		})
+		require.NoError(t, err)
+		deployment, _ = collectSnapshot(t, db, nil)
+		require.True(t, *deployment.IDPOrgSync)
+	})
 }
 
 // nolint:paralleltest
@@ -251,6 +318,47 @@ func TestTelemetryInstallSource(t *testing.T) {
 	db := dbmem.New()
 	deployment, _ := collectSnapshot(t, db, nil)
 	require.Equal(t, "aws_marketplace", deployment.InstallSource)
+}
+
+func TestTelemetryItem(t *testing.T) {
+	t.Parallel()
+	ctx := testutil.Context(t, testutil.WaitMedium)
+	db, _ := dbtestutil.NewDB(t)
+	key := testutil.GetRandomName(t)
+	value := time.Now().Format(time.RFC3339)
+
+	err := db.InsertTelemetryItemIfNotExists(ctx, database.InsertTelemetryItemIfNotExistsParams{
+		Key:   key,
+		Value: value,
+	})
+	require.NoError(t, err)
+
+	item, err := db.GetTelemetryItem(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, item.Key, key)
+	require.Equal(t, item.Value, value)
+
+	// Inserting a new value should not update the existing value
+	err = db.InsertTelemetryItemIfNotExists(ctx, database.InsertTelemetryItemIfNotExistsParams{
+		Key:   key,
+		Value: "new_value",
+	})
+	require.NoError(t, err)
+
+	item, err = db.GetTelemetryItem(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, item.Value, value)
+
+	// Upserting a new value should update the existing value
+	err = db.UpsertTelemetryItem(ctx, database.UpsertTelemetryItemParams{
+		Key:   key,
+		Value: "new_value",
+	})
+	require.NoError(t, err)
+
+	item, err = db.GetTelemetryItem(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, item.Value, "new_value")
 }
 
 func collectSnapshot(t *testing.T, db database.Store, addOptionsFn func(opts telemetry.Options) telemetry.Options) (*telemetry.Deployment, *telemetry.Snapshot) {
