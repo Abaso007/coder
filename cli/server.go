@@ -677,12 +677,13 @@ func (r *RootCmd) Server(newAPI func(context.Context, *coderd.Options) (*coderd.
 				}
 			}
 
-			if vals.OAuth2.Github.ClientSecret != "" {
+			if vals.OAuth2.Github.ClientSecret != "" || vals.OAuth2.Github.DeviceFlow.Value() {
 				options.GithubOAuth2Config, err = configureGithubOAuth2(
 					oauthInstrument,
 					vals.AccessURL.Value(),
 					vals.OAuth2.Github.ClientID.String(),
 					vals.OAuth2.Github.ClientSecret.String(),
+					vals.OAuth2.Github.DeviceFlow.Value(),
 					vals.OAuth2.Github.AllowSignups.Value(),
 					vals.OAuth2.Github.AllowEveryone.Value(),
 					vals.OAuth2.Github.AllowedOrgs,
@@ -938,7 +939,7 @@ func (r *RootCmd) Server(newAPI func(context.Context, *coderd.Options) (*coderd.
 				notificationReportGenerator := reports.NewReportGenerator(ctx, logger.Named("notifications.report_generator"), options.Database, options.NotificationsEnqueuer, quartz.NewReal())
 				defer notificationReportGenerator.Close()
 			} else {
-				cliui.Info(inv.Stdout, "Notifications are currently disabled as there are no configured delivery methods. See https://coder.com/docs/admin/monitoring/notifications#delivery-methods for more details.")
+				logger.Debug(ctx, "notifications are currently disabled as there are no configured delivery methods. See https://coder.com/docs/admin/monitoring/notifications#delivery-methods for more details")
 			}
 
 			// Since errCh only has one buffered slot, all routines
@@ -1831,8 +1832,10 @@ func configureCAPool(tlsClientCAFile string, tlsConfig *tls.Config) error {
 	return nil
 }
 
+// TODO: convert the argument list to a struct, it's easy to mix up the order of the arguments
+//
 //nolint:revive // Ignore flag-parameter: parameter 'allowEveryone' seems to be a control flag, avoid control coupling (revive)
-func configureGithubOAuth2(instrument *promoauth.Factory, accessURL *url.URL, clientID, clientSecret string, allowSignups, allowEveryone bool, allowOrgs []string, rawTeams []string, enterpriseBaseURL string) (*coderd.GithubOAuth2Config, error) {
+func configureGithubOAuth2(instrument *promoauth.Factory, accessURL *url.URL, clientID, clientSecret string, deviceFlow, allowSignups, allowEveryone bool, allowOrgs []string, rawTeams []string, enterpriseBaseURL string) (*coderd.GithubOAuth2Config, error) {
 	redirectURL, err := accessURL.Parse("/api/v2/users/oauth2/github/callback")
 	if err != nil {
 		return nil, xerrors.Errorf("parse github oauth callback url: %w", err)
@@ -1898,6 +1901,17 @@ func configureGithubOAuth2(instrument *promoauth.Factory, accessURL *url.URL, cl
 		return github.NewClient(client), nil
 	}
 
+	var deviceAuth *externalauth.DeviceAuth
+	if deviceFlow {
+		deviceAuth = &externalauth.DeviceAuth{
+			Config:   instrumentedOauth,
+			ClientID: clientID,
+			TokenURL: endpoint.TokenURL,
+			Scopes:   []string{"read:user", "read:org", "user:email"},
+			CodeURL:  endpoint.DeviceAuthURL,
+		}
+	}
+
 	return &coderd.GithubOAuth2Config{
 		OAuth2Config:       instrumentedOauth,
 		AllowSignups:       allowSignups,
@@ -1940,6 +1954,19 @@ func configureGithubOAuth2(instrument *promoauth.Factory, accessURL *url.URL, cl
 			}
 			team, _, err := api.Teams.GetTeamMembershipBySlug(ctx, org, teamSlug, username)
 			return team, err
+		},
+		DeviceFlowEnabled: deviceFlow,
+		ExchangeDeviceCode: func(ctx context.Context, deviceCode string) (*oauth2.Token, error) {
+			if !deviceFlow {
+				return nil, xerrors.New("device flow is not enabled")
+			}
+			return deviceAuth.ExchangeDeviceCode(ctx, deviceCode)
+		},
+		AuthorizeDevice: func(ctx context.Context) (*codersdk.ExternalAuthDevice, error) {
+			if !deviceFlow {
+				return nil, xerrors.New("device flow is not enabled")
+			}
+			return deviceAuth.AuthorizeDevice(ctx)
 		},
 	}, nil
 }
@@ -2022,6 +2049,7 @@ func startBuiltinPostgres(ctx context.Context, cfg config.Root, logger slog.Logg
 			Username("coder").
 			Password(pgPassword).
 			Database("coder").
+			Encoding("UTF8").
 			Port(uint32(pgPort)).
 			Logger(stdlibLogger.Writer()),
 	)
@@ -2565,6 +2593,8 @@ func parseExternalAuthProvidersFromEnv(prefix string, environ []string) ([]coder
 	return providers, nil
 }
 
+var reInvalidPortAfterHost = regexp.MustCompile(`invalid port ".+" after host`)
+
 // If the user provides a postgres URL with a password that contains special
 // characters, the URL will be invalid. We need to escape the password so that
 // the URL parse doesn't fail at the DB connector level.
@@ -2573,7 +2603,11 @@ func escapePostgresURLUserInfo(v string) (string, error) {
 	// I wish I could use errors.Is here, but this error is not declared as a
 	// variable in net/url. :(
 	if err != nil {
-		if strings.Contains(err.Error(), "net/url: invalid userinfo") {
+		// Warning: The parser may also fail with an "invalid port" error if the password contains special
+		// characters. It does not detect invalid user information but instead incorrectly reports an invalid port.
+		//
+		// See: https://github.com/coder/coder/issues/16319
+		if strings.Contains(err.Error(), "net/url: invalid userinfo") || reInvalidPortAfterHost.MatchString(err.Error()) {
 			// If the URL is invalid, we assume it is because the password contains
 			// special characters that need to be escaped.
 
