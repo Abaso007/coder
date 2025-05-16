@@ -2586,6 +2586,7 @@ export interface Template {
 	readonly time_til_dormant_autodelete_ms: number;
 	readonly require_active_version: boolean;
 	readonly max_port_share_level: WorkspaceAgentPortShareLevel;
+	readonly use_classic_parameter_flow: boolean;
 }
 
 // From codersdk/templates.go
@@ -2956,6 +2957,7 @@ export interface UpdateTemplateMeta {
 	readonly deprecation_message?: string;
 	readonly disable_everyone_group_access: boolean;
 	readonly max_port_share_level?: WorkspaceAgentPortShareLevel;
+	readonly use_classic_parameter_flow?: boolean;
 }
 
 // From codersdk/users.go
@@ -3254,6 +3256,7 @@ export interface Workspace {
 // From codersdk/workspaceagents.go
 export interface WorkspaceAgent {
 	readonly id: string;
+	readonly parent_id: string | null;
 	readonly created_at: string;
 	readonly updated_at: string;
 	readonly first_connected_at?: string;

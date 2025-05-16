@@ -691,7 +691,9 @@ func (r *Runner) runTemplateImportProvisionWithRichParameters(
 	err := r.session.Send(&sdkproto.Request{Type: &sdkproto.Request_Plan{Plan: &sdkproto.PlanRequest{
 		Metadata:            metadata,
 		RichParameterValues: richParameterValues,
-		VariableValues:      variableValues,
+		// Template import has no previous values
+		PreviousParameterValues: make([]*sdkproto.RichParameterValue, 0),
+		VariableValues:          variableValues,
 	}}})
 	if err != nil {
 		return nil, xerrors.Errorf("start provision: %w", err)
@@ -960,10 +962,11 @@ func (r *Runner) runWorkspaceBuild(ctx context.Context) (*proto.CompletedJob, *p
 	resp, failed := r.buildWorkspace(ctx, "Planning infrastructure", &sdkproto.Request{
 		Type: &sdkproto.Request_Plan{
 			Plan: &sdkproto.PlanRequest{
-				Metadata:              r.job.GetWorkspaceBuild().Metadata,
-				RichParameterValues:   r.job.GetWorkspaceBuild().RichParameterValues,
-				VariableValues:        r.job.GetWorkspaceBuild().VariableValues,
-				ExternalAuthProviders: r.job.GetWorkspaceBuild().ExternalAuthProviders,
+				Metadata:                r.job.GetWorkspaceBuild().Metadata,
+				RichParameterValues:     r.job.GetWorkspaceBuild().RichParameterValues,
+				PreviousParameterValues: r.job.GetWorkspaceBuild().PreviousParameterValues,
+				VariableValues:          r.job.GetWorkspaceBuild().VariableValues,
+				ExternalAuthProviders:   r.job.GetWorkspaceBuild().ExternalAuthProviders,
 			},
 		},
 	})
@@ -1062,6 +1065,8 @@ func (r *Runner) runWorkspaceBuild(ctx context.Context) (*proto.CompletedJob, *p
 				// called by `plan`. `apply` does not modify them, so we can use the
 				// modules from the plan response.
 				Modules: planComplete.Modules,
+				// Resource replacements are discovered at plan time, only.
+				ResourceReplacements: planComplete.ResourceReplacements,
 			},
 		},
 	}, nil

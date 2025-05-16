@@ -120,6 +120,11 @@ export interface PresetParameter {
   value: string;
 }
 
+export interface ResourceReplacement {
+  resource: string;
+  paths: string[];
+}
+
 /** VariableValue holds the key/value mapping of a Terraform variable. */
 export interface VariableValue {
   name: string;
@@ -174,6 +179,7 @@ export interface Agent {
   order: number;
   resourcesMonitoring: ResourcesMonitoring | undefined;
   devcontainers: Devcontainer[];
+  apiKeyScope: string;
 }
 
 export interface Agent_Metadata {
@@ -297,6 +303,11 @@ export interface Role {
   orgId: string;
 }
 
+export interface RunningAgentAuthToken {
+  agentId: string;
+  token: string;
+}
+
 /** Metadata is information about a workspace used in the execution of a build */
 export interface Metadata {
   coderUrl: string;
@@ -320,8 +331,7 @@ export interface Metadata {
   workspaceOwnerRbacRoles: Role[];
   /** Indicates that a prebuilt workspace is being built. */
   prebuiltWorkspaceBuildStage: PrebuiltWorkspaceBuildStage;
-  /** Preserves the running agent token of a prebuilt workspace so it can reinitialize. */
-  runningWorkspaceAgentToken: string;
+  runningAgentAuthTokens: RunningAgentAuthToken[];
 }
 
 /** Config represents execution configuration shared by all subsequent requests in the Session */
@@ -356,6 +366,7 @@ export interface PlanRequest {
   richParameterValues: RichParameterValue[];
   variableValues: VariableValue[];
   externalAuthProviders: ExternalAuthProvider[];
+  previousParameterValues: RichParameterValue[];
 }
 
 /** PlanComplete indicates a request to plan completed. */
@@ -368,6 +379,7 @@ export interface PlanComplete {
   modules: Module[];
   presets: Preset[];
   plan: Uint8Array;
+  resourceReplacements: ResourceReplacement[];
   moduleFiles: Uint8Array;
 }
 
@@ -568,6 +580,18 @@ export const PresetParameter = {
   },
 };
 
+export const ResourceReplacement = {
+  encode(message: ResourceReplacement, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    if (message.resource !== "") {
+      writer.uint32(10).string(message.resource);
+    }
+    for (const v of message.paths) {
+      writer.uint32(18).string(v!);
+    }
+    return writer;
+  },
+};
+
 export const VariableValue = {
   encode(message: VariableValue, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.name !== "") {
@@ -686,6 +710,9 @@ export const Agent = {
     }
     for (const v of message.devcontainers) {
       Devcontainer.encode(v!, writer.uint32(202).fork()).ldelim();
+    }
+    if (message.apiKeyScope !== "") {
+      writer.uint32(210).string(message.apiKeyScope);
     }
     return writer;
   },
@@ -985,6 +1012,18 @@ export const Role = {
   },
 };
 
+export const RunningAgentAuthToken = {
+  encode(message: RunningAgentAuthToken, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
+    if (message.agentId !== "") {
+      writer.uint32(10).string(message.agentId);
+    }
+    if (message.token !== "") {
+      writer.uint32(18).string(message.token);
+    }
+    return writer;
+  },
+};
+
 export const Metadata = {
   encode(message: Metadata, writer: _m0.Writer = _m0.Writer.create()): _m0.Writer {
     if (message.coderUrl !== "") {
@@ -1047,8 +1086,8 @@ export const Metadata = {
     if (message.prebuiltWorkspaceBuildStage !== 0) {
       writer.uint32(160).int32(message.prebuiltWorkspaceBuildStage);
     }
-    if (message.runningWorkspaceAgentToken !== "") {
-      writer.uint32(170).string(message.runningWorkspaceAgentToken);
+    for (const v of message.runningAgentAuthTokens) {
+      RunningAgentAuthToken.encode(v!, writer.uint32(170).fork()).ldelim();
     }
     return writer;
   },
@@ -1119,6 +1158,9 @@ export const PlanRequest = {
     for (const v of message.externalAuthProviders) {
       ExternalAuthProvider.encode(v!, writer.uint32(34).fork()).ldelim();
     }
+    for (const v of message.previousParameterValues) {
+      RichParameterValue.encode(v!, writer.uint32(42).fork()).ldelim();
+    }
     return writer;
   },
 };
@@ -1149,8 +1191,11 @@ export const PlanComplete = {
     if (message.plan.length !== 0) {
       writer.uint32(74).bytes(message.plan);
     }
+    for (const v of message.resourceReplacements) {
+      ResourceReplacement.encode(v!, writer.uint32(82).fork()).ldelim();
+    }
     if (message.moduleFiles.length !== 0) {
-      writer.uint32(82).bytes(message.moduleFiles);
+      writer.uint32(90).bytes(message.moduleFiles);
     }
     return writer;
   },
