@@ -89,9 +89,7 @@ export const DynamicParameter: FC<DynamicParameterProps> = ({
 					/>
 				)}
 			</div>
-			{parameter.diagnostics.length > 0 && (
-				<ParameterDiagnostics diagnostics={parameter.diagnostics} />
-			)}
+			<ParameterDiagnostics diagnostics={parameter.diagnostics} />
 		</div>
 	);
 };
@@ -112,6 +110,9 @@ const ParameterLabel: FC<ParameterLabelProps> = ({
 	const displayName = parameter.display_name
 		? parameter.display_name
 		: parameter.name;
+	const hasRequiredDiagnostic = parameter.diagnostics?.find(
+		(d) => d.extra?.code === "required",
+	);
 
 	return (
 		<div className="flex items-start gap-2">
@@ -186,6 +187,22 @@ const ParameterLabel: FC<ParameterLabelProps> = ({
 							</Tooltip>
 						</TooltipProvider>
 					)}
+					{hasRequiredDiagnostic && (
+						<TooltipProvider delayDuration={100}>
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<span className="flex items-center">
+										<Badge size="sm" variant="destructive" border="none">
+											Required
+										</Badge>
+									</span>
+								</TooltipTrigger>
+								<TooltipContent className="max-w-xs">
+									{hasRequiredDiagnostic.summary || "Required parameter"}
+								</TooltipContent>
+							</Tooltip>
+						</TooltipProvider>
+					)}
 				</Label>
 
 				{Boolean(parameter.description) && (
@@ -239,18 +256,30 @@ const DebouncedParameterField: FC<DebouncedParameterFieldProps> = ({
 
 		prevDebouncedValueRef.current = debouncedLocalValue;
 	}, [debouncedLocalValue, onChangeEvent]);
+	const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+	const resizeTextarea = useEffectEvent(() => {
+		if (textareaRef.current) {
+			const textarea = textareaRef.current;
+			textarea.style.height = `${textarea.scrollHeight}px`;
+		}
+	});
+
+	useEffect(() => {
+		resizeTextarea();
+	}, [resizeTextarea]);
 
 	switch (parameter.form_type) {
-		case "textarea":
+		case "textarea": {
 			return (
 				<Textarea
+					ref={textareaRef}
 					id={id}
-					className="max-w-2xl"
+					className="overflow-y-auto max-h-[500px]"
 					value={localValue}
 					onChange={(e) => {
 						const target = e.currentTarget;
 						target.style.height = "auto";
-						target.style.maxHeight = "700px";
 						target.style.height = `${target.scrollHeight}px`;
 
 						setLocalValue(e.target.value);
@@ -260,6 +289,7 @@ const DebouncedParameterField: FC<DebouncedParameterFieldProps> = ({
 					required={parameter.required}
 				/>
 			);
+		}
 
 		case "input": {
 			const inputType = parameter.type === "number" ? "number" : "text";
@@ -545,21 +575,26 @@ const ParameterDiagnostics: FC<ParameterDiagnosticsProps> = ({
 	diagnostics,
 }) => {
 	return (
-		<div className="flex flex-col gap-2">
-			{diagnostics.map((diagnostic, index) => (
-				<div
-					key={`parameter-diagnostic-${diagnostic.summary}-${index}`}
-					className={`text-xs px-1 ${
-						diagnostic.severity === "error"
-							? "text-content-destructive"
-							: "text-content-warning"
-					}`}
-				>
-					<p className="font-medium">{diagnostic.summary}</p>
-					{diagnostic.detail && <p className="m-0">{diagnostic.detail}</p>}
-				</div>
-			))}
-		</div>
+		<>
+			{diagnostics.map((diagnostic, index) => {
+				if (diagnostic.extra?.code === "required") {
+					return null;
+				}
+				return (
+					<div
+						key={`parameter-diagnostic-${diagnostic.summary}-${index}`}
+						className={`text-xs px-1 ${
+							diagnostic.severity === "error"
+								? "text-content-destructive"
+								: "text-content-warning"
+						}`}
+					>
+						<p className="font-medium">{diagnostic.summary}</p>
+						{diagnostic.detail && <p className="m-0">{diagnostic.detail}</p>}
+					</div>
+				);
+			})}
+		</>
 	);
 };
 

@@ -7,6 +7,7 @@ import { Button } from "components/Button/Button";
 import { FeatureStageBadge } from "components/FeatureStageBadge/FeatureStageBadge";
 import { Input } from "components/Input/Input";
 import { Label } from "components/Label/Label";
+import { Link } from "components/Link/Link";
 import { Pill } from "components/Pill/Pill";
 import {
 	Select,
@@ -17,9 +18,22 @@ import {
 } from "components/Select/Select";
 import { Spinner } from "components/Spinner/Spinner";
 import { Switch } from "components/Switch/Switch";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipProvider,
+	TooltipTrigger,
+} from "components/Tooltip/Tooltip";
 import { UserAutocomplete } from "components/UserAutocomplete/UserAutocomplete";
 import { type FormikContextType, useFormik } from "formik";
-import { ArrowLeft, CircleAlert, TriangleAlert } from "lucide-react";
+import {
+	ArrowLeft,
+	CircleAlert,
+	CircleHelp,
+	TriangleAlert,
+	Undo2,
+} from "lucide-react";
+import { useSyncFormParameters } from "modules/hooks/useSyncFormParameters";
 import {
 	DynamicParameter,
 	getInitialParameterValues,
@@ -35,6 +49,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { docs } from "utils/docs";
 import { nameValidator } from "utils/formUtils";
 import type { AutofillBuildParameter } from "utils/richParameters";
 import * as Yup from "yup";
@@ -336,7 +351,7 @@ export const CreateWorkspacePageViewExperimental: FC<
 				</button>
 			</div>
 			<div className="flex flex-col gap-6 max-w-screen-md mx-auto">
-				<header className="flex flex-col items-start gap-2 mt-10">
+				<header className="flex flex-col items-start gap-3 mt-10">
 					<div className="flex items-center gap-2">
 						<Avatar
 							variant="icon"
@@ -350,17 +365,45 @@ export const CreateWorkspacePageViewExperimental: FC<
 								: template.name}
 						</p>
 					</div>
-					<h1 className="text-3xl font-semibold m-0">New workspace</h1>
+					<span className="flex flex-row items-center gap-2">
+						<h1 className="text-3xl font-semibold m-0">New workspace</h1>
+						<FeatureStageBadge
+							className="mt-1"
+							contentType={"beta"}
+							labelText="Dynamic parameters"
+						/>
+						<TooltipProvider delayDuration={100}>
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<CircleHelp className="size-icon-xs text-content-secondary" />
+								</TooltipTrigger>
+								<TooltipContent className="max-w-xs text-sm">
+									Dynamic Parameters enhances Coder's existing parameter system
+									with real-time validation, conditional parameter behavior, and
+									richer input types.
+									<br />
+									<Link
+										href={docs(
+											"/admin/templates/extending-templates/parameters#enable-dynamic-parameters-early-access",
+										)}
+									>
+										View docs
+									</Link>
+								</TooltipContent>
+							</Tooltip>
+						</TooltipProvider>
+					</span>
 
 					{template.deprecated && <Pill type="warning">Deprecated</Pill>}
 
 					{experimentalFormContext && (
 						<Button
 							size="sm"
-							variant="subtle"
+							variant="outline"
 							onClick={experimentalFormContext.toggleOptedOut}
 						>
-							Go back to the classic workspace creation flow
+							<Undo2 />
+							Use the classic workspace creation flow
 						</Button>
 					)}
 				</header>
@@ -489,6 +532,10 @@ export const CreateWorkspacePageViewExperimental: FC<
 						</section>
 					)}
 
+					{parameters.length === 0 && diagnostics.length > 0 && (
+						<Diagnostics diagnostics={diagnostics} />
+					)}
+
 					{parameters.length > 0 && (
 						<section className="flex flex-col gap-9">
 							<hgroup>
@@ -496,6 +543,13 @@ export const CreateWorkspacePageViewExperimental: FC<
 								<p className="text-sm text-content-secondary m-0">
 									These are the settings used by your template. Immutable
 									parameters cannot be modified once the workspace is created.
+									<Link
+										href={docs(
+											"/admin/templates/extending-templates/parameters#enable-dynamic-parameters-early-access",
+										)}
+									>
+										View docs
+									</Link>
 								</p>
 							</hgroup>
 							{diagnostics.length > 0 && (
@@ -652,52 +706,3 @@ const Diagnostics: FC<DiagnosticsProps> = ({ diagnostics }) => {
 		</div>
 	);
 };
-
-type UseSyncFormParametersProps = {
-	parameters: readonly PreviewParameter[];
-	formValues: readonly TypesGen.WorkspaceBuildParameter[];
-	setFieldValue: (
-		field: string,
-		value: TypesGen.WorkspaceBuildParameter[],
-	) => void;
-};
-
-function useSyncFormParameters({
-	parameters,
-	formValues,
-	setFieldValue,
-}: UseSyncFormParametersProps) {
-	// Form values only needs to be updated when parameters change
-	// Keep track of form values in a ref to avoid unnecessary updates to rich_parameter_values
-	const formValuesRef = useRef(formValues);
-
-	useEffect(() => {
-		formValuesRef.current = formValues;
-	}, [formValues]);
-
-	useEffect(() => {
-		if (!parameters) return;
-		const currentFormValues = formValuesRef.current;
-
-		const newParameterValues = parameters.map((param) => {
-			return {
-				name: param.name,
-				value: param.value.valid ? param.value.value : "",
-			};
-		});
-
-		const isChanged =
-			currentFormValues.length !== newParameterValues.length ||
-			newParameterValues.some(
-				(p) =>
-					!currentFormValues.find(
-						(formValue) =>
-							formValue.name === p.name && formValue.value === p.value,
-					),
-			);
-
-		if (isChanged) {
-			setFieldValue("rich_parameter_values", newParameterValues);
-		}
-	}, [parameters, setFieldValue]);
-}
