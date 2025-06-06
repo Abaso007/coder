@@ -28,34 +28,69 @@ import (
 	"github.com/coder/quartz"
 )
 
-// fakeLister implements the agentcontainers.Lister interface for
+// fakeContainerCLI implements the agentcontainers.ContainerCLI interface for
 // testing.
-type fakeLister struct {
+type fakeContainerCLI struct {
 	containers codersdk.WorkspaceAgentListContainersResponse
-	err        error
+	listErr    error
+	arch       string
+	archErr    error
+	copyErr    error
+	execErr    error
 }
 
-func (f *fakeLister) List(_ context.Context) (codersdk.WorkspaceAgentListContainersResponse, error) {
-	return f.containers, f.err
+func (f *fakeContainerCLI) List(_ context.Context) (codersdk.WorkspaceAgentListContainersResponse, error) {
+	return f.containers, f.listErr
+}
+
+func (f *fakeContainerCLI) DetectArchitecture(_ context.Context, _ string) (string, error) {
+	return f.arch, f.archErr
+}
+
+func (f *fakeContainerCLI) Copy(ctx context.Context, name, src, dst string) error {
+	return f.copyErr
+}
+
+func (f *fakeContainerCLI) ExecAs(ctx context.Context, name, user string, args ...string) ([]byte, error) {
+	return nil, f.execErr
 }
 
 // fakeDevcontainerCLI implements the agentcontainers.DevcontainerCLI
 // interface for testing.
 type fakeDevcontainerCLI struct {
-	id         string
-	err        error
-	continueUp chan struct{}
+	upID     string
+	upErr    error
+	upErrC   chan error // If set, send to return err, close to return upErr.
+	execErr  error
+	execErrC chan error // If set, send to return err, close to return execErr.
 }
 
 func (f *fakeDevcontainerCLI) Up(ctx context.Context, _, _ string, _ ...agentcontainers.DevcontainerCLIUpOptions) (string, error) {
-	if f.continueUp != nil {
+	if f.upErrC != nil {
 		select {
 		case <-ctx.Done():
-			return "", xerrors.New("test timeout")
-		case <-f.continueUp:
+			return "", ctx.Err()
+		case err, ok := <-f.upErrC:
+			if ok {
+				return f.upID, err
+			}
 		}
 	}
-	return f.id, f.err
+	return f.upID, f.upErr
+}
+
+func (f *fakeDevcontainerCLI) Exec(ctx context.Context, _, _ string, _ string, _ []string, _ ...agentcontainers.DevcontainerCLIExecOptions) error {
+	if f.execErrC != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err, ok := <-f.execErrC:
+			if ok {
+				return err
+			}
+		}
+	}
+	return f.execErr
 }
 
 // fakeWatcher implements the watcher.Watcher interface for testing.
@@ -180,7 +215,7 @@ func TestAPI(t *testing.T) {
 			// initialData to be stored in the handler
 			initialData initialDataPayload
 			// function to set up expectations for the mock
-			setupMock func(mcl *acmock.MockLister, preReq *gomock.Call)
+			setupMock func(mcl *acmock.MockContainerCLI, preReq *gomock.Call)
 			// expected result
 			expected codersdk.WorkspaceAgentListContainersResponse
 			// expected error
@@ -189,7 +224,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "no initial data",
 				initialData: initialDataPayload{makeResponse(), nil},
-				setupMock: func(mcl *acmock.MockLister, preReq *gomock.Call) {
+				setupMock: func(mcl *acmock.MockContainerCLI, preReq *gomock.Call) {
 					mcl.EXPECT().List(gomock.Any()).Return(makeResponse(fakeCt), nil).After(preReq).AnyTimes()
 				},
 				expected: makeResponse(fakeCt),
@@ -207,7 +242,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "lister error only during initial data",
 				initialData: initialDataPayload{makeResponse(), assert.AnError},
-				setupMock: func(mcl *acmock.MockLister, preReq *gomock.Call) {
+				setupMock: func(mcl *acmock.MockContainerCLI, preReq *gomock.Call) {
 					mcl.EXPECT().List(gomock.Any()).Return(makeResponse(fakeCt), nil).After(preReq).AnyTimes()
 				},
 				expected: makeResponse(fakeCt),
@@ -215,7 +250,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "lister error after initial data",
 				initialData: initialDataPayload{makeResponse(fakeCt), nil},
-				setupMock: func(mcl *acmock.MockLister, preReq *gomock.Call) {
+				setupMock: func(mcl *acmock.MockContainerCLI, preReq *gomock.Call) {
 					mcl.EXPECT().List(gomock.Any()).Return(makeResponse(), assert.AnError).After(preReq).AnyTimes()
 				},
 				expectedErr: assert.AnError.Error(),
@@ -223,7 +258,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "updated data",
 				initialData: initialDataPayload{makeResponse(fakeCt), nil},
-				setupMock: func(mcl *acmock.MockLister, preReq *gomock.Call) {
+				setupMock: func(mcl *acmock.MockContainerCLI, preReq *gomock.Call) {
 					mcl.EXPECT().List(gomock.Any()).Return(makeResponse(fakeCt2), nil).After(preReq).AnyTimes()
 				},
 				expected: makeResponse(fakeCt2),
@@ -236,7 +271,7 @@ func TestAPI(t *testing.T) {
 					mClock     = quartz.NewMock(t)
 					tickerTrap = mClock.Trap().TickerFunc("updaterLoop")
 					mCtrl      = gomock.NewController(t)
-					mLister    = acmock.NewMockLister(mCtrl)
+					mLister    = acmock.NewMockContainerCLI(mCtrl)
 					logger     = slogtest.Make(t, &slogtest.Options{IgnoreErrors: true}).Leveled(slog.LevelDebug)
 					r          = chi.NewRouter()
 				)
@@ -250,14 +285,14 @@ func TestAPI(t *testing.T) {
 
 				api := agentcontainers.NewAPI(logger,
 					agentcontainers.WithClock(mClock),
-					agentcontainers.WithLister(mLister),
+					agentcontainers.WithContainerCLI(mLister),
 				)
 				defer api.Close()
 				r.Mount("/", api.Routes())
 
 				// Make sure the ticker function has been registered
 				// before advancing the clock.
-				tickerTrap.MustWait(ctx).Release()
+				tickerTrap.MustWait(ctx).MustRelease(ctx)
 				tickerTrap.Close()
 
 				// Initial request returns the initial data.
@@ -326,7 +361,7 @@ func TestAPI(t *testing.T) {
 		tests := []struct {
 			name            string
 			containerID     string
-			lister          *fakeLister
+			lister          *fakeContainerCLI
 			devcontainerCLI *fakeDevcontainerCLI
 			wantStatus      []int
 			wantBody        []string
@@ -334,7 +369,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:            "Missing container ID",
 				containerID:     "",
-				lister:          &fakeLister{},
+				lister:          &fakeContainerCLI{},
 				devcontainerCLI: &fakeDevcontainerCLI{},
 				wantStatus:      []int{http.StatusBadRequest},
 				wantBody:        []string{"Missing container ID or name"},
@@ -342,8 +377,8 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "List error",
 				containerID: "container-id",
-				lister: &fakeLister{
-					err: xerrors.New("list error"),
+				lister: &fakeContainerCLI{
+					listErr: xerrors.New("list error"),
 				},
 				devcontainerCLI: &fakeDevcontainerCLI{},
 				wantStatus:      []int{http.StatusInternalServerError},
@@ -352,7 +387,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "Container not found",
 				containerID: "nonexistent-container",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{validContainer},
 					},
@@ -364,7 +399,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "Missing workspace folder label",
 				containerID: "missing-folder-container",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{missingFolderContainer},
 					},
@@ -376,13 +411,13 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "Devcontainer CLI error",
 				containerID: "container-id",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{validContainer},
 					},
 				},
 				devcontainerCLI: &fakeDevcontainerCLI{
-					err: xerrors.New("devcontainer CLI error"),
+					upErr: xerrors.New("devcontainer CLI error"),
 				},
 				wantStatus: []int{http.StatusAccepted, http.StatusConflict},
 				wantBody:   []string{"Devcontainer recreation initiated", "Devcontainer recreation already in progress"},
@@ -390,7 +425,7 @@ func TestAPI(t *testing.T) {
 			{
 				name:        "OK",
 				containerID: "container-id",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{validContainer},
 					},
@@ -416,14 +451,14 @@ func TestAPI(t *testing.T) {
 				nowRecreateErrorTrap := mClock.Trap().Now("recreate", "errorTimes")
 				nowRecreateSuccessTrap := mClock.Trap().Now("recreate", "successTimes")
 
-				tt.devcontainerCLI.continueUp = make(chan struct{})
+				tt.devcontainerCLI.upErrC = make(chan error)
 
 				// Setup router with the handler under test.
 				r := chi.NewRouter()
 				api := agentcontainers.NewAPI(
 					logger,
 					agentcontainers.WithClock(mClock),
-					agentcontainers.WithLister(tt.lister),
+					agentcontainers.WithContainerCLI(tt.lister),
 					agentcontainers.WithDevcontainerCLI(tt.devcontainerCLI),
 					agentcontainers.WithWatcher(watcher.NewNoop()),
 				)
@@ -432,7 +467,7 @@ func TestAPI(t *testing.T) {
 
 				// Make sure the ticker function has been registered
 				// before advancing the clock.
-				tickerTrap.MustWait(ctx).Release()
+				tickerTrap.MustWait(ctx).MustRelease(ctx)
 				tickerTrap.Close()
 
 				for i := range tt.wantStatus {
@@ -454,7 +489,7 @@ func TestAPI(t *testing.T) {
 				// because we must check what state the devcontainer ends up in
 				// after the recreation process is initiated and finished.
 				if tt.wantStatus[0] != http.StatusAccepted {
-					close(tt.devcontainerCLI.continueUp)
+					close(tt.devcontainerCLI.upErrC)
 					nowRecreateSuccessTrap.Close()
 					nowRecreateErrorTrap.Close()
 					return
@@ -477,16 +512,18 @@ func TestAPI(t *testing.T) {
 				require.NoError(t, err, "unmarshal response failed")
 				require.Len(t, resp.Devcontainers, 1, "expected one devcontainer in response")
 				assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusStarting, resp.Devcontainers[0].Status, "devcontainer is not starting")
+				require.NotNil(t, resp.Devcontainers[0].Container, "devcontainer should have container reference")
+				assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusStarting, resp.Devcontainers[0].Container.DevcontainerStatus, "container dc status is not starting")
 
 				// Allow the devcontainer CLI to continue the up process.
-				close(tt.devcontainerCLI.continueUp)
+				close(tt.devcontainerCLI.upErrC)
 
 				// Ensure the devcontainer ends up in error state if the up call fails.
-				if tt.devcontainerCLI.err != nil {
+				if tt.devcontainerCLI.upErr != nil {
 					nowRecreateSuccessTrap.Close()
 					// The timestamp for the error will be stored, which gives
 					// us a good anchor point to know when to do our request.
-					nowRecreateErrorTrap.MustWait(ctx).Release()
+					nowRecreateErrorTrap.MustWait(ctx).MustRelease(ctx)
 					nowRecreateErrorTrap.Close()
 
 					// Advance the clock to run the devcontainer state update routine.
@@ -503,11 +540,13 @@ func TestAPI(t *testing.T) {
 					require.NoError(t, err, "unmarshal response failed after error")
 					require.Len(t, resp.Devcontainers, 1, "expected one devcontainer in response after error")
 					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusError, resp.Devcontainers[0].Status, "devcontainer is not in an error state after up failure")
+					require.NotNil(t, resp.Devcontainers[0].Container, "devcontainer should have container reference after up failure")
+					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusError, resp.Devcontainers[0].Container.DevcontainerStatus, "container dc status is not error after up failure")
 					return
 				}
 
 				// Ensure the devcontainer ends up in success state.
-				nowRecreateSuccessTrap.MustWait(ctx).Release()
+				nowRecreateSuccessTrap.MustWait(ctx).MustRelease(ctx)
 				nowRecreateSuccessTrap.Close()
 
 				// Advance the clock to run the devcontainer state update routine.
@@ -525,7 +564,9 @@ func TestAPI(t *testing.T) {
 				err = json.NewDecoder(rec.Body).Decode(&resp)
 				require.NoError(t, err, "unmarshal response failed after recreation")
 				require.Len(t, resp.Devcontainers, 1, "expected one devcontainer in response after recreation")
-				assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, resp.Devcontainers[0].Status, "devcontainer is not stopped after recreation")
+				assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, resp.Devcontainers[0].Status, "devcontainer is not running after recreation")
+				require.NotNil(t, resp.Devcontainers[0].Container, "devcontainer should have container reference after recreation")
+				assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, resp.Devcontainers[0].Container.DevcontainerStatus, "container dc status is not running after recreation")
 			})
 		}
 	})
@@ -553,7 +594,7 @@ func TestAPI(t *testing.T) {
 
 		tests := []struct {
 			name               string
-			lister             *fakeLister
+			lister             *fakeContainerCLI
 			knownDevcontainers []codersdk.WorkspaceAgentDevcontainer
 			wantStatus         int
 			wantCount          int
@@ -561,20 +602,20 @@ func TestAPI(t *testing.T) {
 		}{
 			{
 				name: "List error",
-				lister: &fakeLister{
-					err: xerrors.New("list error"),
+				lister: &fakeContainerCLI{
+					listErr: xerrors.New("list error"),
 				},
 				wantStatus: http.StatusInternalServerError,
 			},
 			{
 				name:       "Empty containers",
-				lister:     &fakeLister{},
+				lister:     &fakeContainerCLI{},
 				wantStatus: http.StatusOK,
 				wantCount:  0,
 			},
 			{
 				name: "Only known devcontainers, no containers",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{},
 					},
@@ -591,7 +632,7 @@ func TestAPI(t *testing.T) {
 			},
 			{
 				name: "Runtime-detected devcontainer",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{
 							{
@@ -620,11 +661,12 @@ func TestAPI(t *testing.T) {
 					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, dc.Status)
 					require.NotNil(t, dc.Container)
 					assert.Equal(t, "runtime-container-1", dc.Container.ID)
+					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, dc.Container.DevcontainerStatus)
 				},
 			},
 			{
 				name: "Mixed known and runtime-detected devcontainers",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{
 							{
@@ -660,17 +702,19 @@ func TestAPI(t *testing.T) {
 					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusStopped, known2.Status)
 					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, runtime1.Status)
 
-					require.NotNil(t, known1.Container)
 					assert.Nil(t, known2.Container)
-					require.NotNil(t, runtime1.Container)
 
+					require.NotNil(t, known1.Container)
 					assert.Equal(t, "known-container-1", known1.Container.ID)
+					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, known1.Container.DevcontainerStatus)
+					require.NotNil(t, runtime1.Container)
 					assert.Equal(t, "runtime-container-1", runtime1.Container.ID)
+					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, runtime1.Container.DevcontainerStatus)
 				},
 			},
 			{
 				name: "Both running and non-running containers have container references",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{
 							{
@@ -704,15 +748,17 @@ func TestAPI(t *testing.T) {
 					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusStopped, nonRunning.Status)
 
 					require.NotNil(t, running.Container, "running container should have container reference")
-					require.NotNil(t, nonRunning.Container, "non-running container should have container reference")
-
 					assert.Equal(t, "running-container", running.Container.ID)
+					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, running.Container.DevcontainerStatus)
+
+					require.NotNil(t, nonRunning.Container, "non-running container should have container reference")
 					assert.Equal(t, "non-running-container", nonRunning.Container.ID)
+					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusStopped, nonRunning.Container.DevcontainerStatus)
 				},
 			},
 			{
 				name: "Config path update",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{
 							{
@@ -743,11 +789,12 @@ func TestAPI(t *testing.T) {
 					assert.NotEmpty(t, dc2.ConfigPath)
 					require.NotNil(t, dc2.Container)
 					assert.Equal(t, "known-container-2", dc2.Container.ID)
+					assert.Equal(t, codersdk.WorkspaceAgentDevcontainerStatusRunning, dc2.Container.DevcontainerStatus)
 				},
 			},
 			{
 				name: "Name generation and uniqueness",
-				lister: &fakeLister{
+				lister: &fakeContainerCLI{
 					containers: codersdk.WorkspaceAgentListContainersResponse{
 						Containers: []codersdk.WorkspaceAgentContainer{
 							{
@@ -811,10 +858,15 @@ func TestAPI(t *testing.T) {
 
 				logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true}).Leveled(slog.LevelDebug)
 
+				mClock := quartz.NewMock(t)
+				mClock.Set(time.Now()).MustWait(testutil.Context(t, testutil.WaitShort))
+				tickerTrap := mClock.Trap().TickerFunc("updaterLoop")
+
 				// Setup router with the handler under test.
 				r := chi.NewRouter()
 				apiOptions := []agentcontainers.Option{
-					agentcontainers.WithLister(tt.lister),
+					agentcontainers.WithClock(mClock),
+					agentcontainers.WithContainerCLI(tt.lister),
 					agentcontainers.WithWatcher(watcher.NewNoop()),
 				}
 
@@ -837,6 +889,15 @@ func TestAPI(t *testing.T) {
 				r.Mount("/", api.Routes())
 
 				ctx := testutil.Context(t, testutil.WaitShort)
+
+				// Make sure the ticker function has been registered
+				// before advancing the clock.
+				tickerTrap.MustWait(ctx).MustRelease(ctx)
+				tickerTrap.Close()
+
+				// Advance the clock to run the updater loop.
+				_, aw := mClock.AdvanceNext()
+				aw.MustWait(ctx)
 
 				req := httptest.NewRequest(http.MethodGet, "/devcontainers", nil).
 					WithContext(ctx)
@@ -888,7 +949,7 @@ func TestAPI(t *testing.T) {
 		ctx := testutil.Context(t, testutil.WaitShort)
 
 		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
-		fLister := &fakeLister{
+		fLister := &fakeContainerCLI{
 			containers: codersdk.WorkspaceAgentListContainersResponse{
 				Containers: []codersdk.WorkspaceAgentContainer{container},
 			},
@@ -900,7 +961,7 @@ func TestAPI(t *testing.T) {
 
 		api := agentcontainers.NewAPI(logger,
 			agentcontainers.WithClock(mClock),
-			agentcontainers.WithLister(fLister),
+			agentcontainers.WithContainerCLI(fLister),
 			agentcontainers.WithWatcher(fWatcher),
 			agentcontainers.WithDevcontainers(
 				[]codersdk.WorkspaceAgentDevcontainer{dc},
@@ -911,7 +972,7 @@ func TestAPI(t *testing.T) {
 
 		// Make sure the ticker function has been registered
 		// before advancing any use of mClock.Advance.
-		tickerTrap.MustWait(ctx).Release()
+		tickerTrap.MustWait(ctx).MustRelease(ctx)
 		tickerTrap.Close()
 
 		// Make sure the start loop has been called.
@@ -987,7 +1048,7 @@ func TestAPI(t *testing.T) {
 		mClock.Set(startTime)
 		tickerTrap := mClock.Trap().TickerFunc("updaterLoop")
 		fWatcher := newFakeWatcher(t)
-		fLister := &fakeLister{
+		fLister := &fakeContainerCLI{
 			containers: codersdk.WorkspaceAgentListContainersResponse{
 				Containers: []codersdk.WorkspaceAgentContainer{container},
 			},
@@ -996,7 +1057,7 @@ func TestAPI(t *testing.T) {
 		logger := slogtest.Make(t, nil).Leveled(slog.LevelDebug)
 		api := agentcontainers.NewAPI(
 			logger,
-			agentcontainers.WithLister(fLister),
+			agentcontainers.WithContainerCLI(fLister),
 			agentcontainers.WithWatcher(fWatcher),
 			agentcontainers.WithClock(mClock),
 		)
@@ -1007,7 +1068,7 @@ func TestAPI(t *testing.T) {
 
 		// Make sure the ticker function has been registered
 		// before advancing any use of mClock.Advance.
-		tickerTrap.MustWait(ctx).Release()
+		tickerTrap.MustWait(ctx).MustRelease(ctx)
 		tickerTrap.Close()
 
 		// Call the list endpoint first to ensure config files are

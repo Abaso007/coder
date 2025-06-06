@@ -43,7 +43,7 @@ func TestNoReconciliationActionsIfNoPresets(t *testing.T) {
 	t.Parallel()
 
 	if !dbtestutil.WillUsePostgres() {
-		t.Skip("This test requires postgres")
+		t.Skip("dbmem times out on nesting transactions, postgres ignores the inner ones")
 	}
 
 	clock := quartz.NewMock(t)
@@ -88,7 +88,7 @@ func TestNoReconciliationActionsIfNoPrebuilds(t *testing.T) {
 	t.Parallel()
 
 	if !dbtestutil.WillUsePostgres() {
-		t.Skip("This test requires postgres")
+		t.Skip("dbmem times out on nesting transactions, postgres ignores the inner ones")
 	}
 
 	clock := quartz.NewMock(t)
@@ -1137,7 +1137,7 @@ func TestRunLoop(t *testing.T) {
 	trap := clock.Trap().NewTicker()
 	go reconciler.Run(ctx)
 	// wait until ticker is initialized
-	trap.MustWait(ctx).Release()
+	trap.MustWait(ctx).MustRelease(ctx)
 	// start 1st iteration of ReconciliationLoop
 	// NOTE: at this point MustWait waits that iteration is started (ReconcileAll is called), but it doesn't wait until it completes
 	clock.Advance(cfg.ReconciliationInterval.Value()).MustWait(ctx)

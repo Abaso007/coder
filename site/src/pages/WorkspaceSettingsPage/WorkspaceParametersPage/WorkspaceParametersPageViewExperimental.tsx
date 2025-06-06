@@ -5,6 +5,7 @@ import type {
 } from "api/typesGenerated";
 import { Alert } from "components/Alert/Alert";
 import { Button } from "components/Button/Button";
+import { Label } from "components/Label/Label";
 import { Link } from "components/Link/Link";
 import { Spinner } from "components/Spinner/Spinner";
 import { useFormik } from "formik";
@@ -16,9 +17,11 @@ import {
 } from "modules/workspaces/DynamicParameter/DynamicParameter";
 import type { FC } from "react";
 import { docs } from "utils/docs";
+import type { AutofillBuildParameter } from "utils/richParameters";
 
 type WorkspaceParametersPageViewExperimentalProps = {
 	workspace: Workspace;
+	autofillParameters: AutofillBuildParameter[];
 	parameters: PreviewParameter[];
 	diagnostics: PreviewParameter["diagnostics"];
 	canChangeVersions: boolean;
@@ -28,12 +31,14 @@ type WorkspaceParametersPageViewExperimentalProps = {
 		rich_parameter_values: WorkspaceBuildParameter[];
 	}) => void;
 	sendMessage: (formValues: Record<string, string>) => void;
+	templateVersionId: string | undefined;
 };
 
 export const WorkspaceParametersPageViewExperimental: FC<
 	WorkspaceParametersPageViewExperimentalProps
 > = ({
 	workspace,
+	autofillParameters,
 	parameters,
 	diagnostics,
 	canChangeVersions,
@@ -41,18 +46,34 @@ export const WorkspaceParametersPageViewExperimental: FC<
 	onSubmit,
 	sendMessage,
 	onCancel,
+	templateVersionId,
 }) => {
+	const autofillByName = Object.fromEntries(
+		autofillParameters.map((param) => [param.name, param]),
+	);
+	const initialTouched = parameters.reduce(
+		(touched, parameter) => {
+			if (autofillByName[parameter.name] !== undefined) {
+				touched[parameter.name] = true;
+			}
+			return touched;
+		},
+		{} as Record<string, boolean>,
+	);
 	const form = useFormik({
 		onSubmit,
 		initialValues: {
-			rich_parameter_values: getInitialParameterValues(parameters),
+			rich_parameter_values: getInitialParameterValues(
+				parameters,
+				autofillParameters,
+			),
 		},
+		initialTouched,
 		validationSchema: useValidationSchemaForDynamicParameters(parameters),
 		enableReinitialize: false,
 		validateOnChange: true,
 		validateOnBlur: true,
 	});
-
 	// Group parameters by ephemeral status
 	const ephemeralParameters = parameters.filter((p) => p.ephemeral);
 	const standardParameters = parameters.filter((p) => !p.ephemeral);
@@ -131,6 +152,15 @@ export const WorkspaceParametersPageViewExperimental: FC<
 							)}
 						</div>
 					))}
+				</div>
+			)}
+
+			{(templateVersionId || workspace.latest_build.template_version_id) && (
+				<div className="flex flex-col gap-2">
+					<Label className="text-sm text-content-secondary">Version ID</Label>
+					<p className="m-0 text-sm font-medium">
+						{templateVersionId ?? workspace.latest_build.template_version_id}
+					</p>
 				</div>
 			)}
 
@@ -218,10 +248,21 @@ export const WorkspaceParametersPageViewExperimental: FC<
 					</Button>
 					<Button
 						type="submit"
-						disabled={isSubmitting || disabled || !form.dirty}
+						disabled={
+							isSubmitting ||
+							disabled ||
+							diagnostics.some(
+								(diagnostic) => diagnostic.severity === "error",
+							) ||
+							parameters.some((parameter) =>
+								parameter.diagnostics.some(
+									(diagnostic) => diagnostic.severity === "error",
+								),
+							)
+						}
 					>
 						<Spinner loading={isSubmitting} />
-						Submit and restart
+						Update and restart
 					</Button>
 				</div>
 			</form>

@@ -251,14 +251,23 @@ func (c *StoreReconciler) ReconcileAll(ctx context.Context) error {
 
 	logger.Debug(ctx, "starting reconciliation")
 
-	err := c.WithReconciliationLock(ctx, logger, func(ctx context.Context, db database.Store) error {
-		snapshot, err := c.SnapshotState(ctx, db)
+	err := c.WithReconciliationLock(ctx, logger, func(ctx context.Context, _ database.Store) error {
+		snapshot, err := c.SnapshotState(ctx, c.store)
 		if err != nil {
 			return xerrors.Errorf("determine current snapshot: %w", err)
 		}
+
+		c.reportHardLimitedPresets(snapshot)
+
 		if len(snapshot.Presets) == 0 {
 			logger.Debug(ctx, "no templates found with prebuilds configured")
 			return nil
+		}
+
+		membershipReconciler := NewStoreMembershipReconciler(c.store, c.clock)
+		err = membershipReconciler.ReconcileAll(ctx, prebuilds.SystemUserID, snapshot.Presets)
+		if err != nil {
+			return xerrors.Errorf("reconcile prebuild membership: %w", err)
 		}
 
 		var eg errgroup.Group
@@ -294,6 +303,49 @@ func (c *StoreReconciler) ReconcileAll(ctx context.Context) error {
 	}
 
 	return err
+}
+
+func (c *StoreReconciler) reportHardLimitedPresets(snapshot *prebuilds.GlobalSnapshot) {
+	// presetsMap is a map from key (orgName:templateName:presetName) to list of corresponding presets.
+	// Multiple versions of a preset can exist with the same orgName, templateName, and presetName,
+	// because templates can have multiple versions — or deleted templates can share the same name.
+	presetsMap := make(map[hardLimitedPresetKey][]database.GetTemplatePresetsWithPrebuildsRow)
+	for _, preset := range snapshot.Presets {
+		key := hardLimitedPresetKey{
+			orgName:      preset.OrganizationName,
+			templateName: preset.TemplateName,
+			presetName:   preset.Name,
+		}
+
+		presetsMap[key] = append(presetsMap[key], preset)
+	}
+
+	// Report a preset as hard-limited only if all the following conditions are met:
+	// - The preset is marked as hard-limited
+	// - The preset is using the active version of its template, and the template has not been deleted
+	//
+	// The second condition is important because a hard-limited preset that has become outdated is no longer relevant.
+	// Its associated prebuilt workspaces were likely deleted, and it's not meaningful to continue reporting it
+	// as hard-limited to the admin.
+	//
+	// This approach accounts for all relevant scenarios:
+	// Scenario #1: The admin created a new template version with the same preset names.
+	// Scenario #2: The admin created a new template version and renamed the presets.
+	// Scenario #3: The admin deleted a template version that contained hard-limited presets.
+	//
+	// In all of these cases, only the latest and non-deleted presets will be reported.
+	// All other presets will be ignored and eventually removed from Prometheus.
+	isPresetHardLimited := make(map[hardLimitedPresetKey]bool)
+	for key, presets := range presetsMap {
+		for _, preset := range presets {
+			if preset.UsingActiveVersion && !preset.Deleted && snapshot.IsHardLimited(preset.ID) {
+				isPresetHardLimited[key] = true
+				break
+			}
+		}
+	}
+
+	c.metrics.registerHardLimitedPresets(isPresetHardLimited)
 }
 
 // SnapshotState captures the current state of all prebuilds across templates.
@@ -360,16 +412,6 @@ func (c *StoreReconciler) ReconcilePreset(ctx context.Context, ps prebuilds.Pres
 		slog.F("preset_id", ps.Preset.ID),
 		slog.F("preset_name", ps.Preset.Name),
 	)
-
-	// Report a preset as hard-limited only if all the following conditions are met:
-	// - The preset is marked as hard-limited
-	// - The preset is using the active version of its template, and the template has not been deleted
-	//
-	// The second condition is important because a hard-limited preset that has become outdated is no longer relevant.
-	// Its associated prebuilt workspaces were likely deleted, and it's not meaningful to continue reporting it
-	// as hard-limited to the admin.
-	reportAsHardLimited := ps.IsHardLimited && ps.Preset.UsingActiveVersion && !ps.Preset.Deleted
-	c.metrics.trackHardLimitedStatus(ps.Preset.OrganizationName, ps.Preset.TemplateName, ps.Preset.Name, reportAsHardLimited)
 
 	// If the preset reached the hard failure limit for the first time during this iteration:
 	// - Mark it as hard-limited in the database

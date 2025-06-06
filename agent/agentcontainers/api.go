@@ -43,7 +43,7 @@ type API struct {
 	logger            slog.Logger
 	watcher           watcher.Watcher
 	execer            agentexec.Execer
-	cl                Lister
+	ccli              ContainerCLI
 	dccli             DevcontainerCLI
 	clock             quartz.Clock
 	scriptLogger      func(logSourceID uuid.UUID) ScriptLogger
@@ -80,11 +80,11 @@ func WithExecer(execer agentexec.Execer) Option {
 	}
 }
 
-// WithLister sets the agentcontainers.Lister implementation to use.
-// The default implementation uses the Docker CLI to list containers.
-func WithLister(cl Lister) Option {
+// WithContainerCLI sets the agentcontainers.ContainerCLI implementation
+// to use. The default implementation uses the Docker CLI.
+func WithContainerCLI(ccli ContainerCLI) Option {
 	return func(api *API) {
-		api.cl = cl
+		api.ccli = ccli
 	}
 }
 
@@ -186,8 +186,8 @@ func NewAPI(logger slog.Logger, options ...Option) *API {
 	for _, opt := range options {
 		opt(api)
 	}
-	if api.cl == nil {
-		api.cl = NewDocker(api.execer)
+	if api.ccli == nil {
+		api.ccli = NewDockerCLI(api.execer)
 	}
 	if api.dccli == nil {
 		api.dccli = NewDevcontainerCLI(logger.Named("devcontainer-cli"), api.execer)
@@ -363,7 +363,7 @@ func (api *API) updateContainers(ctx context.Context) error {
 	listCtx, listCancel := context.WithTimeout(ctx, listContainersTimeout)
 	defer listCancel()
 
-	updated, err := api.cl.List(listCtx)
+	updated, err := api.ccli.List(listCtx)
 	if err != nil {
 		// If the context was canceled, we hold off on clearing the
 		// containers cache. This is to avoid clearing the cache if
@@ -378,6 +378,8 @@ func (api *API) updateContainers(ctx context.Context) error {
 
 		return xerrors.Errorf("list containers failed: %w", err)
 	}
+	// Clone to avoid test flakes due to data manipulation.
+	updated.Containers = slices.Clone(updated.Containers)
 
 	api.mu.Lock()
 	defer api.mu.Unlock()
@@ -403,6 +405,7 @@ func (api *API) processUpdatedContainersLocked(ctx context.Context, updated code
 	// Check if the container is running and update the known devcontainers.
 	for i := range updated.Containers {
 		container := &updated.Containers[i] // Grab a reference to the container to allow mutating it.
+		container.DevcontainerStatus = ""   // Reset the status for the container (updated later).
 		container.DevcontainerDirty = false // Reset dirty state for the container (updated later).
 
 		workspaceFolder := container.Labels[DevcontainerLocalFolderLabel]
@@ -465,9 +468,17 @@ func (api *API) processUpdatedContainersLocked(ctx context.Context, updated code
 	for _, dc := range api.knownDevcontainers {
 		switch {
 		case dc.Status == codersdk.WorkspaceAgentDevcontainerStatusStarting:
+			if dc.Container != nil {
+				dc.Container.DevcontainerStatus = dc.Status
+				dc.Container.DevcontainerDirty = dc.Dirty
+			}
 			continue // This state is handled by the recreation routine.
 
 		case dc.Status == codersdk.WorkspaceAgentDevcontainerStatusError && (dc.Container == nil || dc.Container.CreatedAt.Before(api.recreateErrorTimes[dc.WorkspaceFolder])):
+			if dc.Container != nil {
+				dc.Container.DevcontainerStatus = dc.Status
+				dc.Container.DevcontainerDirty = dc.Dirty
+			}
 			continue // The devcontainer needs to be recreated.
 
 		case dc.Container != nil:
@@ -475,6 +486,7 @@ func (api *API) processUpdatedContainersLocked(ctx context.Context, updated code
 			if dc.Container.Running {
 				dc.Status = codersdk.WorkspaceAgentDevcontainerStatusRunning
 			}
+			dc.Container.DevcontainerStatus = dc.Status
 
 			dc.Dirty = false
 			if lastModified, hasModTime := api.configFileModifiedTimes[dc.ConfigPath]; hasModTime && dc.Container.CreatedAt.Before(lastModified) {
@@ -608,6 +620,9 @@ func (api *API) handleDevcontainerRecreate(w http.ResponseWriter, r *http.Reques
 	// Update the status so that we don't try to recreate the
 	// devcontainer multiple times in parallel.
 	dc.Status = codersdk.WorkspaceAgentDevcontainerStatusStarting
+	if dc.Container != nil {
+		dc.Container.DevcontainerStatus = dc.Status
+	}
 	api.knownDevcontainers[dc.WorkspaceFolder] = dc
 	api.recreateWg.Add(1)
 	go api.recreateDevcontainer(dc, configPath)
@@ -669,7 +684,7 @@ func (api *API) recreateDevcontainer(dc codersdk.WorkspaceAgentDevcontainer, con
 
 	logger.Debug(ctx, "starting devcontainer recreation")
 
-	_, err = api.dccli.Up(ctx, dc.WorkspaceFolder, configPath, WithOutput(infoW, errW), WithRemoveExistingContainer())
+	_, err = api.dccli.Up(ctx, dc.WorkspaceFolder, configPath, WithUpOutput(infoW, errW), WithRemoveExistingContainer())
 	if err != nil {
 		// No need to log if the API is closing (context canceled), as this
 		// is expected behavior when the API is shutting down.
@@ -680,6 +695,9 @@ func (api *API) recreateDevcontainer(dc codersdk.WorkspaceAgentDevcontainer, con
 		api.mu.Lock()
 		dc = api.knownDevcontainers[dc.WorkspaceFolder]
 		dc.Status = codersdk.WorkspaceAgentDevcontainerStatusError
+		if dc.Container != nil {
+			dc.Container.DevcontainerStatus = dc.Status
+		}
 		api.knownDevcontainers[dc.WorkspaceFolder] = dc
 		api.recreateErrorTimes[dc.WorkspaceFolder] = api.clock.Now("recreate", "errorTimes")
 		api.mu.Unlock()
@@ -695,10 +713,12 @@ func (api *API) recreateDevcontainer(dc codersdk.WorkspaceAgentDevcontainer, con
 	// allows the update routine to update the devcontainer status, but
 	// to minimize the time between API consistency, we guess the status
 	// based on the container state.
-	if dc.Container != nil && dc.Container.Running {
-		dc.Status = codersdk.WorkspaceAgentDevcontainerStatusRunning
-	} else {
-		dc.Status = codersdk.WorkspaceAgentDevcontainerStatusStopped
+	dc.Status = codersdk.WorkspaceAgentDevcontainerStatusStopped
+	if dc.Container != nil {
+		if dc.Container.Running {
+			dc.Status = codersdk.WorkspaceAgentDevcontainerStatusRunning
+		}
+		dc.Container.DevcontainerStatus = dc.Status
 	}
 	dc.Dirty = false
 	api.recreateSuccessTimes[dc.WorkspaceFolder] = api.clock.Now("recreate", "successTimes")
