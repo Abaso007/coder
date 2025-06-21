@@ -999,8 +999,7 @@ func (s *MethodTestSuite) TestOrganization() {
 			PresetID: preset.ID,
 		}
 		check.Args(arg).
-			Asserts(rbac.ResourceTemplate, policy.ActionUpdate).
-			ErrorsWithInMemDB(dbmem.ErrUnimplemented)
+			Asserts(rbac.ResourceTemplate, policy.ActionUpdate)
 	}))
 	s.Run("DeleteOrganizationMember", s.Subtest(func(db database.Store, check *expects) {
 		o := dbgen.Organization(s.T(), db, database.Organization{})
@@ -4942,8 +4941,7 @@ func (s *MethodTestSuite) TestPrebuilds() {
 	s.Run("GetActivePresetPrebuildSchedules", s.Subtest(func(db database.Store, check *expects) {
 		check.Args().
 			Asserts(rbac.ResourceTemplate.All(), policy.ActionRead).
-			Returns([]database.TemplateVersionPresetPrebuildSchedule{}).
-			ErrorsWithInMemDB(dbmem.ErrUnimplemented)
+			Returns([]database.TemplateVersionPresetPrebuildSchedule{})
 	}))
 	s.Run("GetPresetsByTemplateVersionID", s.Subtest(func(db database.Store, check *expects) {
 		ctx := context.Background()
@@ -5562,5 +5560,65 @@ func (s *MethodTestSuite) TestChat() {
 			Title:     "new title",
 			UpdatedAt: dbtime.Now(),
 		}).Asserts(c, policy.ActionUpdate)
+	}))
+}
+
+func (s *MethodTestSuite) TestAuthorizePrebuiltWorkspace() {
+	s.Run("PrebuildDelete/InsertWorkspaceBuild", s.Subtest(func(db database.Store, check *expects) {
+		u := dbgen.User(s.T(), db, database.User{})
+		o := dbgen.Organization(s.T(), db, database.Organization{})
+		tpl := dbgen.Template(s.T(), db, database.Template{
+			OrganizationID: o.ID,
+			CreatedBy:      u.ID,
+		})
+		w := dbgen.Workspace(s.T(), db, database.WorkspaceTable{
+			TemplateID:     tpl.ID,
+			OrganizationID: o.ID,
+			OwnerID:        database.PrebuildsSystemUserID,
+		})
+		pj := dbgen.ProvisionerJob(s.T(), db, nil, database.ProvisionerJob{
+			OrganizationID: o.ID,
+		})
+		tv := dbgen.TemplateVersion(s.T(), db, database.TemplateVersion{
+			TemplateID:     uuid.NullUUID{UUID: tpl.ID, Valid: true},
+			OrganizationID: o.ID,
+			CreatedBy:      u.ID,
+		})
+		check.Args(database.InsertWorkspaceBuildParams{
+			WorkspaceID:       w.ID,
+			Transition:        database.WorkspaceTransitionDelete,
+			Reason:            database.BuildReasonInitiator,
+			TemplateVersionID: tv.ID,
+			JobID:             pj.ID,
+		}).Asserts(w.AsPrebuild(), policy.ActionDelete)
+	}))
+	s.Run("PrebuildUpdate/InsertWorkspaceBuildParameters", s.Subtest(func(db database.Store, check *expects) {
+		u := dbgen.User(s.T(), db, database.User{})
+		o := dbgen.Organization(s.T(), db, database.Organization{})
+		tpl := dbgen.Template(s.T(), db, database.Template{
+			OrganizationID: o.ID,
+			CreatedBy:      u.ID,
+		})
+		w := dbgen.Workspace(s.T(), db, database.WorkspaceTable{
+			TemplateID:     tpl.ID,
+			OrganizationID: o.ID,
+			OwnerID:        database.PrebuildsSystemUserID,
+		})
+		pj := dbgen.ProvisionerJob(s.T(), db, nil, database.ProvisionerJob{
+			OrganizationID: o.ID,
+		})
+		tv := dbgen.TemplateVersion(s.T(), db, database.TemplateVersion{
+			TemplateID:     uuid.NullUUID{UUID: tpl.ID, Valid: true},
+			OrganizationID: o.ID,
+			CreatedBy:      u.ID,
+		})
+		wb := dbgen.WorkspaceBuild(s.T(), db, database.WorkspaceBuild{
+			JobID:             pj.ID,
+			WorkspaceID:       w.ID,
+			TemplateVersionID: tv.ID,
+		})
+		check.Args(database.InsertWorkspaceBuildParametersParams{
+			WorkspaceBuildID: wb.ID,
+		}).Asserts(w.AsPrebuild(), policy.ActionUpdate)
 	}))
 }

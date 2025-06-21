@@ -15259,6 +15259,7 @@ const docTemplate = `{
                 "oauth2_app_secret",
                 "organization",
                 "organization_member",
+                "prebuilt_workspace",
                 "provisioner_daemon",
                 "provisioner_jobs",
                 "replicas",
@@ -15298,6 +15299,7 @@ const docTemplate = `{
                 "ResourceOauth2AppSecret",
                 "ResourceOrganization",
                 "ResourceOrganizationMember",
+                "ResourcePrebuiltWorkspace",
                 "ResourceProvisionerDaemon",
                 "ResourceProvisionerJobs",
                 "ResourceReplicas",
@@ -18079,11 +18081,13 @@ const docTemplate = `{
             "type": "string",
             "enum": [
                 "working",
+                "idle",
                 "complete",
                 "failure"
             ],
             "x-enum-varnames": [
                 "WorkspaceAppStatusStateWorking",
+                "WorkspaceAppStatusStateIdle",
                 "WorkspaceAppStatusStateComplete",
                 "WorkspaceAppStatusStateFailure"
             ]
@@ -18091,6 +18095,10 @@ const docTemplate = `{
         "codersdk.WorkspaceBuild": {
             "type": "object",
             "properties": {
+                "ai_task_sidebar_app_id": {
+                    "type": "string",
+                    "format": "uuid"
+                },
                 "build_number": {
                     "type": "integer"
                 },
@@ -18104,6 +18112,9 @@ const docTemplate = `{
                 "deadline": {
                     "type": "string",
                     "format": "date-time"
+                },
+                "has_ai_task": {
+                    "type": "boolean"
                 },
                 "id": {
                     "type": "string",

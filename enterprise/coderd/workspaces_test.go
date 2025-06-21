@@ -32,7 +32,6 @@ import (
 	"github.com/coder/coder/v2/coderd/database/dbtime"
 	"github.com/coder/coder/v2/coderd/httpmw"
 	"github.com/coder/coder/v2/coderd/notifications"
-	"github.com/coder/coder/v2/coderd/prebuilds"
 	"github.com/coder/coder/v2/coderd/provisionerdserver"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/rbac/policy"
@@ -496,7 +495,7 @@ func TestCreateUserWorkspace(t *testing.T) {
 		}).Do()
 
 		r := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
-			OwnerID:    prebuilds.SystemUserID,
+			OwnerID:    database.PrebuildsSystemUserID,
 			TemplateID: tv.Template.ID,
 		}).Seed(database.WorkspaceBuild{
 			TemplateVersionID: tv.TemplateVersion.ID,
@@ -1953,7 +1952,6 @@ func TestWorkspaceTagsTerraform(t *testing.T) {
 				}`,
 		},
 	} {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			client, owner := coderdenttest.New(t, &coderdenttest.Options{
 				Options: &coderdtest.Options{

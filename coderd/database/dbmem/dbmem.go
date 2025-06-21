@@ -23,11 +23,9 @@ import (
 	"golang.org/x/exp/maps"
 	"golang.org/x/xerrors"
 
-	"github.com/coder/coder/v2/coderd/notifications/types"
-	"github.com/coder/coder/v2/coderd/prebuilds"
-
 	"github.com/coder/coder/v2/coderd/database"
 	"github.com/coder/coder/v2/coderd/database/dbtime"
+	"github.com/coder/coder/v2/coderd/notifications/types"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/rbac/regosql"
 	"github.com/coder/coder/v2/coderd/util/slice"
@@ -75,6 +73,7 @@ func New() database.Store {
 			parameterSchemas:               make([]database.ParameterSchema, 0),
 			presets:                        make([]database.TemplateVersionPreset, 0),
 			presetParameters:               make([]database.TemplateVersionPresetParameter, 0),
+			presetPrebuildSchedules:        make([]database.TemplateVersionPresetPrebuildSchedule, 0),
 			provisionerDaemons:             make([]database.ProvisionerDaemon, 0),
 			provisionerJobs:                make([]database.ProvisionerJob, 0),
 			provisionerJobLogs:             make([]database.ProvisionerJobLog, 0),
@@ -159,7 +158,7 @@ func New() database.Store {
 	q.mutex.Lock()
 	// We can't insert this user using the interface, because it's a system user.
 	q.data.users = append(q.data.users, database.User{
-		ID:             prebuilds.SystemUserID,
+		ID:             database.PrebuildsSystemUserID,
 		Email:          "prebuilds@coder.com",
 		Username:       "prebuilds",
 		CreatedAt:      dbtime.Now(),
@@ -299,6 +298,7 @@ type data struct {
 	telemetryItems                   []database.TelemetryItem
 	presets                          []database.TemplateVersionPreset
 	presetParameters                 []database.TemplateVersionPresetParameter
+	presetPrebuildSchedules          []database.TemplateVersionPresetPrebuildSchedule
 }
 
 func tryPercentileCont(fs []float64, p float64) float64 {
@@ -1811,7 +1811,6 @@ func (q *FakeQuerier) CustomRoles(_ context.Context, arg database.CustomRolesPar
 
 	found := make([]database.CustomRole, 0)
 	for _, role := range q.data.customRoles {
-		role := role
 		if len(arg.LookupRoles) > 0 {
 			if !slices.ContainsFunc(arg.LookupRoles, func(pair database.NameOrganizationPair) bool {
 				if pair.Name != role.Name {
@@ -2779,7 +2778,42 @@ func (q *FakeQuerier) GetAPIKeysLastUsedAfter(_ context.Context, after time.Time
 }
 
 func (q *FakeQuerier) GetActivePresetPrebuildSchedules(ctx context.Context) ([]database.TemplateVersionPresetPrebuildSchedule, error) {
-	return nil, ErrUnimplemented
+	q.mutex.RLock()
+	defer q.mutex.RUnlock()
+
+	var activeSchedules []database.TemplateVersionPresetPrebuildSchedule
+
+	// Create a map of active template version IDs for quick lookup
+	activeTemplateVersions := make(map[uuid.UUID]bool)
+	for _, template := range q.templates {
+		if !template.Deleted && template.Deprecated == "" {
+			activeTemplateVersions[template.ActiveVersionID] = true
+		}
+	}
+
+	// Create a map of presets for quick lookup
+	presetMap := make(map[uuid.UUID]database.TemplateVersionPreset)
+	for _, preset := range q.presets {
+		presetMap[preset.ID] = preset
+	}
+
+	// Filter preset prebuild schedules to only include those for active template versions
+	for _, schedule := range q.presetPrebuildSchedules {
+		// Look up the preset using the map
+		preset, exists := presetMap[schedule.PresetID]
+		if !exists {
+			continue
+		}
+
+		// Check if preset's template version is active
+		if !activeTemplateVersions[preset.TemplateVersionID] {
+			continue
+		}
+
+		activeSchedules = append(activeSchedules, schedule)
+	}
+
+	return activeSchedules, nil
 }
 
 // nolint:revive // It's not a control flag, it's a filter.
@@ -2885,7 +2919,6 @@ func (q *FakeQuerier) GetAuthorizationUserRoles(_ context.Context, userID uuid.U
 	roles := make([]string, 0)
 	for _, u := range q.users {
 		if u.ID == userID {
-			u := u
 			roles = append(roles, u.RBACRoles...)
 			roles = append(roles, "member")
 			user = &u
@@ -8088,7 +8121,6 @@ func (q *FakeQuerier) GetWorkspaceByOwnerIDAndName(_ context.Context, arg databa
 
 	var found *database.WorkspaceTable
 	for _, workspace := range q.workspaces {
-		workspace := workspace
 		if workspace.OwnerID != arg.OwnerID {
 			continue
 		}
@@ -8146,7 +8178,6 @@ func (q *FakeQuerier) GetWorkspaceByWorkspaceAppID(_ context.Context, workspaceA
 	defer q.mutex.RUnlock()
 
 	for _, workspaceApp := range q.workspaceApps {
-		workspaceApp := workspaceApp
 		if workspaceApp.ID == workspaceAppID {
 			return q.getWorkspaceByAgentIDNoLock(context.Background(), workspaceApp.AgentID)
 		}
@@ -9201,7 +9232,17 @@ func (q *FakeQuerier) InsertPresetPrebuildSchedule(ctx context.Context, arg data
 		return database.TemplateVersionPresetPrebuildSchedule{}, err
 	}
 
-	return database.TemplateVersionPresetPrebuildSchedule{}, ErrUnimplemented
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+
+	presetPrebuildSchedule := database.TemplateVersionPresetPrebuildSchedule{
+		ID:               uuid.New(),
+		PresetID:         arg.PresetID,
+		CronExpression:   arg.CronExpression,
+		DesiredInstances: arg.DesiredInstances,
+	}
+	q.presetPrebuildSchedules = append(q.presetPrebuildSchedules, presetPrebuildSchedule)
+	return presetPrebuildSchedule, nil
 }
 
 func (q *FakeQuerier) InsertProvisionerJob(_ context.Context, arg database.InsertProvisionerJobParams) (database.ProvisionerJob, error) {
@@ -10379,7 +10420,6 @@ func (q *FakeQuerier) OrganizationMembers(_ context.Context, arg database.Organi
 			continue
 		}
 
-		organizationMember := organizationMember
 		user, _ := q.getUserByIDNoLock(organizationMember.UserID)
 		tmp = append(tmp, database.OrganizationMembersRow{
 			OrganizationMember: organizationMember,

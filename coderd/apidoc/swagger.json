@@ -13851,6 +13851,7 @@
 				"oauth2_app_secret",
 				"organization",
 				"organization_member",
+				"prebuilt_workspace",
 				"provisioner_daemon",
 				"provisioner_jobs",
 				"replicas",
@@ -13890,6 +13891,7 @@
 				"ResourceOauth2AppSecret",
 				"ResourceOrganization",
 				"ResourceOrganizationMember",
+				"ResourcePrebuiltWorkspace",
 				"ResourceProvisionerDaemon",
 				"ResourceProvisionerJobs",
 				"ResourceReplicas",
@@ -16520,9 +16522,10 @@
 		},
 		"codersdk.WorkspaceAppStatusState": {
 			"type": "string",
-			"enum": ["working", "complete", "failure"],
+			"enum": ["working", "idle", "complete", "failure"],
 			"x-enum-varnames": [
 				"WorkspaceAppStatusStateWorking",
+				"WorkspaceAppStatusStateIdle",
 				"WorkspaceAppStatusStateComplete",
 				"WorkspaceAppStatusStateFailure"
 			]
@@ -16530,6 +16533,10 @@
 		"codersdk.WorkspaceBuild": {
 			"type": "object",
 			"properties": {
+				"ai_task_sidebar_app_id": {
+					"type": "string",
+					"format": "uuid"
+				},
 				"build_number": {
 					"type": "integer"
 				},
@@ -16543,6 +16550,9 @@
 				"deadline": {
 					"type": "string",
 					"format": "date-time"
+				},
+				"has_ai_task": {
+					"type": "boolean"
 				},
 				"id": {
 					"type": "string",
