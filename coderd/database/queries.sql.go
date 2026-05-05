@@ -2993,6 +2993,37 @@ func (q *sqlQuerier) DeleteChatDebugDataByChatID(ctx context.Context, arg Delete
 	return result.RowsAffected()
 }
 
+const deleteOldChatDebugRuns = `-- name: DeleteOldChatDebugRuns :execrows
+WITH deletable AS (
+    SELECT id, chat_id
+    FROM chat_debug_runs
+    WHERE updated_at < $1::timestamptz
+    ORDER BY updated_at ASC
+    LIMIT $2::int
+)
+DELETE FROM chat_debug_runs
+USING deletable
+WHERE chat_debug_runs.id = deletable.id
+    AND chat_debug_runs.chat_id = deletable.chat_id
+`
+
+type DeleteOldChatDebugRunsParams struct {
+	BeforeTime time.Time `db:"before_time" json:"before_time"`
+	LimitCount int32     `db:"limit_count" json:"limit_count"`
+}
+
+// updated_at is the retention clock, so the window starts after the run
+// stops being written to.
+// Intentionally no finished_at IS NOT NULL guard: abandoned in-flight rows
+// older than the cutoff are also purged.
+func (q *sqlQuerier) DeleteOldChatDebugRuns(ctx context.Context, arg DeleteOldChatDebugRunsParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteOldChatDebugRuns, arg.BeforeTime, arg.LimitCount)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const finalizeStaleChatDebugRows = `-- name: FinalizeStaleChatDebugRows :one
 WITH finalized_runs AS (
     UPDATE chat_debug_runs
@@ -3236,6 +3267,8 @@ type InsertChatDebugRunParams struct {
 	FinishedAt          sql.NullTime          `db:"finished_at" json:"finished_at"`
 }
 
+// updated_at is the retention clock used by DeleteOldChatDebugRuns.
+// Set it on every write to keep retention semantics correct.
 func (q *sqlQuerier) InsertChatDebugRun(ctx context.Context, arg InsertChatDebugRunParams) (ChatDebugRun, error) {
 	row := q.db.QueryRowContext(ctx, insertChatDebugRun,
 		arg.ChatID,
@@ -3503,6 +3536,7 @@ type UpdateChatDebugRunParams struct {
 // write-once-finalize pattern where fields are set at creation
 // or finalization and never cleared back to NULL. The @now
 // parameter keeps updated_at under the caller's clock.
+// updated_at is also the retention clock used by DeleteOldChatDebugRuns.
 //
 // finished_at is enforced as write-once at the SQL level: once
 // populated it cannot be overwritten by a later call. Callers
@@ -20595,6 +20629,22 @@ func (q *sqlQuerier) GetChatDebugLoggingAllowUsers(ctx context.Context) (bool, e
 	return allow_users, err
 }
 
+const getChatDebugRetentionDays = `-- name: GetChatDebugRetentionDays :one
+SELECT COALESCE(
+    (SELECT value::integer FROM site_configs
+     WHERE key = 'agents_chat_debug_retention_days'),
+    $1::integer
+) :: integer AS debug_retention_days
+`
+
+// Chat debug run retention window in days. 0 disables.
+func (q *sqlQuerier) GetChatDebugRetentionDays(ctx context.Context, defaultDebugRetentionDays int32) (int32, error) {
+	row := q.db.QueryRowContext(ctx, getChatDebugRetentionDays, defaultDebugRetentionDays)
+	var debug_retention_days int32
+	err := row.Scan(&debug_retention_days)
+	return debug_retention_days, err
+}
+
 const getChatDesktopEnabled = `-- name: GetChatDesktopEnabled :one
 SELECT
 	COALESCE((SELECT value = 'true' FROM site_configs WHERE key = 'agents_desktop_enabled'), false) :: boolean AS enable_desktop
@@ -21024,6 +21074,18 @@ WHERE site_configs.key = 'agents_chat_debug_logging_allow_users'
 // allows users to opt into chat debug logging.
 func (q *sqlQuerier) UpsertChatDebugLoggingAllowUsers(ctx context.Context, allowUsers bool) error {
 	_, err := q.db.ExecContext(ctx, upsertChatDebugLoggingAllowUsers, allowUsers)
+	return err
+}
+
+const upsertChatDebugRetentionDays = `-- name: UpsertChatDebugRetentionDays :exec
+INSERT INTO site_configs (key, value)
+VALUES ('agents_chat_debug_retention_days', CAST($1 AS integer)::text)
+ON CONFLICT (key) DO UPDATE SET value = CAST($1 AS integer)::text
+WHERE site_configs.key = 'agents_chat_debug_retention_days'
+`
+
+func (q *sqlQuerier) UpsertChatDebugRetentionDays(ctx context.Context, debugRetentionDays int32) error {
+	_, err := q.db.ExecContext(ctx, upsertChatDebugRetentionDays, debugRetentionDays)
 	return err
 }
 
