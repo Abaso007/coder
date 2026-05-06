@@ -632,6 +632,25 @@ WHERE
     id = @id::uuid
 RETURNING *;
 
+-- name: UpdateChatLastTurnSummary :execrows
+-- Updates the cached last completed turn summary for sidebar display.
+-- Empty or whitespace-only summaries are stored as NULL here so direct
+-- query callers cannot accidentally persist blank sidebar text.
+-- This intentionally preserves updated_at. The staleness guard relies on
+-- every new-turn query, such as UpdateChatStatus and AcquireChats, bumping
+-- updated_at. Future chat-field updates that do not bump updated_at can let
+-- stale summaries persist. If this query ever bumps updated_at, later
+-- goroutine summary writes will be rejected as stale.
+-- Two summary workers using the same freshness marker are last-write-wins.
+UPDATE chats
+SET
+    last_turn_summary = NULLIF(REGEXP_REPLACE(
+        sqlc.narg('last_turn_summary')::text, '^[[:space:]]+|[[:space:]]+$', '', 'g'
+    ), '')
+WHERE
+    id = @id::uuid
+    AND updated_at = @expected_updated_at::timestamptz;
+
 -- name: UpdateChatMCPServerIDs :one
 UPDATE
     chats

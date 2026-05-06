@@ -4047,6 +4047,93 @@ func TestPersistToolResultWithBinaryData(t *testing.T) {
 	require.True(t, foundToolResultInSecondCall, "expected second streamed model call to include execute tool output")
 }
 
+func TestRequiresActionChatClearsLastTurnSummary(t *testing.T) {
+	t.Parallel()
+
+	db, ps := dbtestutil.NewDB(t)
+	ctx := testutil.Context(t, testutil.WaitLong)
+
+	openAIURL := chattest.NewOpenAI(t, func(req *chattest.OpenAIRequest) chattest.OpenAIResponse {
+		if !req.Stream {
+			return chattest.OpenAINonStreamingResponse("Dynamic tool test")
+		}
+		return chattest.OpenAIStreamingResponse(
+			chattest.OpenAIToolCallChunk(
+				"my_dynamic_tool",
+				`{"input":"hello world"}`,
+			),
+		)
+	})
+
+	mockPush := &mockWebpushDispatcher{}
+	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true})
+	server := chatd.New(chatd.Config{
+		Logger:                     logger,
+		Database:                   db,
+		ReplicaID:                  uuid.New(),
+		Pubsub:                     ps,
+		PendingChatAcquireInterval: 10 * time.Millisecond,
+		InFlightChatStaleAfter:     testutil.WaitSuperLong,
+		WebpushDispatcher:          mockPush,
+	})
+	t.Cleanup(func() {
+		require.NoError(t, server.Close())
+	})
+
+	user, org, model := seedChatDependenciesWithProvider(t, db, "openai-compat", openAIURL)
+
+	dynamicToolsJSON, err := json.Marshal([]mcpgo.Tool{{
+		Name:        "my_dynamic_tool",
+		Description: "A test dynamic tool.",
+		InputSchema: mcpgo.ToolInputSchema{
+			Type: "object",
+			Properties: map[string]any{
+				"input": map[string]any{"type": "string"},
+			},
+			Required: []string{"input"},
+		},
+	}})
+	require.NoError(t, err)
+
+	chat, err := server.CreateChat(ctx, chatd.CreateOptions{
+		OrganizationID: org.ID,
+		OwnerID:        user.ID,
+		Title:          "requires-action-summary-clear",
+		ModelConfigID:  model.ID,
+		InitialUserContent: []codersdk.ChatMessagePart{
+			codersdk.ChatMessageText("Please call the dynamic tool."),
+		},
+		DynamicTools: dynamicToolsJSON,
+	})
+	require.NoError(t, err)
+	seedLastTurnSummary(ctx, t, db, chat, "previous summary")
+
+	server.Start()
+
+	var fromDB database.Chat
+	testutil.Eventually(ctx, t, func(ctx context.Context) bool {
+		got, dbErr := db.GetChatByID(ctx, chat.ID)
+		if dbErr != nil {
+			return false
+		}
+		fromDB = got
+		if got.Status == database.ChatStatusError {
+			return true
+		}
+		return got.Status == database.ChatStatusRequiresAction &&
+			!got.LastTurnSummary.Valid
+	}, testutil.IntervalFast)
+	chatd.WaitUntilIdleForTest(server)
+
+	require.Equal(t, database.ChatStatusRequiresAction, fromDB.Status,
+		"expected requires_action, got %s (last_error=%q)",
+		fromDB.Status, string(fromDB.LastError.RawMessage))
+	require.False(t, fromDB.LastTurnSummary.Valid,
+		"requires action chats should clear cached turn summaries")
+	require.Equal(t, int32(0), mockPush.dispatchCount.Load(),
+		"expected no web push dispatch for a requires_action chat")
+}
+
 func TestDynamicToolCallPausesAndResumes(t *testing.T) {
 	t.Parallel()
 
@@ -5907,6 +5994,24 @@ func seedChatDependenciesWithProviderPolicy(
 	return user, org, providerConfig, model
 }
 
+func seedLastTurnSummary(
+	ctx context.Context,
+	t *testing.T,
+	db database.Store,
+	chat database.Chat,
+	summary string,
+) {
+	t.Helper()
+
+	affected, err := db.UpdateChatLastTurnSummary(ctx, database.UpdateChatLastTurnSummaryParams{
+		ID:                chat.ID,
+		ExpectedUpdatedAt: chat.UpdatedAt,
+		LastTurnSummary:   sql.NullString{String: summary, Valid: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected)
+}
+
 func waitForTerminalChatStatusEvent(
 	ctx context.Context,
 	t *testing.T,
@@ -6121,7 +6226,6 @@ func TestInterruptChatDoesNotSendWebPushNotification(t *testing.T) {
 		InFlightChatStaleAfter:     testutil.WaitSuperLong,
 		WebpushDispatcher:          mockPush,
 	})
-	server.Start()
 	t.Cleanup(func() {
 		require.NoError(t, server.Close())
 	})
@@ -6137,6 +6241,9 @@ func TestInterruptChatDoesNotSendWebPushNotification(t *testing.T) {
 		InitialUserContent: []codersdk.ChatMessagePart{codersdk.ChatMessageText("hello")},
 	})
 	require.NoError(t, err)
+	seedLastTurnSummary(ctx, t, db, chat, "previous summary")
+
+	server.Start()
 
 	// Wait for the chat to be picked up and start streaming.
 	testutil.Eventually(ctx, t, func(ctx context.Context) bool {
@@ -6168,6 +6275,12 @@ func TestInterruptChatDoesNotSendWebPushNotification(t *testing.T) {
 		}
 		return fromDB.Status == database.ChatStatusWaiting && !fromDB.WorkerID.Valid
 	}, testutil.IntervalFast)
+	chatd.WaitUntilIdleForTest(server)
+
+	fromDB, err := db.GetChatByID(ctx, chat.ID)
+	require.NoError(t, err)
+	require.False(t, fromDB.LastTurnSummary.Valid,
+		"interrupted chats should clear cached turn summaries")
 
 	// Verify no web push notification was dispatched.
 	require.Equal(t, int32(0), mockPush.dispatchCount.Load(),
@@ -6435,7 +6548,7 @@ func TestSuccessfulChatSendsWebPushWithSummary(t *testing.T) {
 	user, org, model := seedChatDependencies(t, db)
 	setOpenAIProviderBaseURL(ctx, t, db, openAIURL)
 
-	_, err := server.CreateChat(ctx, chatd.CreateOptions{
+	chat, err := server.CreateChat(ctx, chatd.CreateOptions{
 		OrganizationID:     org.ID,
 		OwnerID:            user.ID,
 		Title:              "summary-push-test",
@@ -6447,17 +6560,69 @@ func TestSuccessfulChatSendsWebPushWithSummary(t *testing.T) {
 	// The push notification is dispatched asynchronously after the
 	// chat finishes, so we poll for it rather than checking
 	// immediately after the status transitions to waiting.
+	var fromDB database.Chat
 	testutil.Eventually(ctx, t, func(ctx context.Context) bool {
-		return mockPush.dispatchCount.Load() >= 1
+		var dbErr error
+		fromDB, dbErr = db.GetChatByID(ctx, chat.ID)
+		return dbErr == nil && mockPush.dispatchCount.Load() >= 1 && fromDB.LastTurnSummary.Valid
 	}, testutil.IntervalFast)
 
 	msg := mockPush.getLastMessage()
-	require.Equal(t, summaryText, msg.Body,
-		"push body should be the LLM-generated summary")
+	require.Equal(t, summaryText, fromDB.LastTurnSummary.String,
+		"last turn summary should be the LLM-generated summary")
+	require.Equal(t, fromDB.LastTurnSummary.String, msg.Body,
+		"push body should reuse the persisted generated summary")
 	require.NotEqual(t, "Agent has finished running.", msg.Body,
 		"push body should not use the default fallback text")
 	require.Equal(t, int32(1), nonStreamingRequests.Load(),
 		"expected exactly one non-streaming request for push summary generation")
+}
+
+func TestSuccessfulChatPersistsTurnSummaryWithoutWebPush(t *testing.T) {
+	t.Parallel()
+
+	db, ps := dbtestutil.NewDB(t)
+	ctx := testutil.Context(t, testutil.WaitLong)
+
+	const assistantText = "I fixed the bug and added regression coverage."
+	const summaryText = "Fixed the bug and added regression coverage."
+
+	var nonStreamingRequests atomic.Int32
+	openAIURL := chattest.NewOpenAI(t, func(req *chattest.OpenAIRequest) chattest.OpenAIResponse {
+		if !req.Stream {
+			nonStreamingRequests.Add(1)
+			return chattest.OpenAINonStreamingResponse(summaryText)
+		}
+		return chattest.OpenAIStreamingResponse(
+			chattest.OpenAITextChunks(assistantText)...,
+		)
+	})
+
+	server := newActiveTestServer(t, db, ps)
+
+	user, org, model := seedChatDependencies(t, db)
+	setOpenAIProviderBaseURL(ctx, t, db, openAIURL)
+
+	chat, err := server.CreateChat(ctx, chatd.CreateOptions{
+		OrganizationID:     org.ID,
+		OwnerID:            user.ID,
+		Title:              "summary-no-webpush-test",
+		ModelConfigID:      model.ID,
+		InitialUserContent: []codersdk.ChatMessagePart{codersdk.ChatMessageText("do the thing")},
+	})
+	require.NoError(t, err)
+
+	var fromDB database.Chat
+	testutil.Eventually(ctx, t, func(ctx context.Context) bool {
+		var dbErr error
+		fromDB, dbErr = db.GetChatByID(ctx, chat.ID)
+		return dbErr == nil && fromDB.LastTurnSummary.Valid
+	}, testutil.IntervalFast)
+
+	require.Equal(t, summaryText, fromDB.LastTurnSummary.String,
+		"summary should persist even when web push is unavailable")
+	require.Equal(t, int32(1), nonStreamingRequests.Load(),
+		"expected exactly one non-streaming request for summary generation")
 }
 
 func TestSuccessfulChatSendsWebPushFallbackWithoutSummaryForEmptyAssistantText(t *testing.T) {
@@ -6489,7 +6654,6 @@ func TestSuccessfulChatSendsWebPushFallbackWithoutSummaryForEmptyAssistantText(t
 		InFlightChatStaleAfter:     testutil.WaitSuperLong,
 		WebpushDispatcher:          mockPush,
 	})
-	server.Start()
 	t.Cleanup(func() {
 		require.NoError(t, server.Close())
 	})
@@ -6497,7 +6661,7 @@ func TestSuccessfulChatSendsWebPushFallbackWithoutSummaryForEmptyAssistantText(t
 	user, org, model := seedChatDependencies(t, db)
 	setOpenAIProviderBaseURL(ctx, t, db, openAIURL)
 
-	_, err := server.CreateChat(ctx, chatd.CreateOptions{
+	chat, err := server.CreateChat(ctx, chatd.CreateOptions{
 		OrganizationID:     org.ID,
 		OwnerID:            user.ID,
 		Title:              "empty-summary-push-test",
@@ -6505,16 +6669,86 @@ func TestSuccessfulChatSendsWebPushFallbackWithoutSummaryForEmptyAssistantText(t
 		InitialUserContent: []codersdk.ChatMessagePart{codersdk.ChatMessageText("do the thing")},
 	})
 	require.NoError(t, err)
+	seedLastTurnSummary(ctx, t, db, chat, "previous summary")
+
+	server.Start()
 
 	testutil.Eventually(ctx, t, func(ctx context.Context) bool {
 		return mockPush.dispatchCount.Load() >= 1
 	}, testutil.IntervalFast)
+
+	fromDB, err := db.GetChatByID(ctx, chat.ID)
+	require.NoError(t, err)
+	require.False(t, fromDB.LastTurnSummary.Valid,
+		"fallback push text should not be persisted")
 
 	msg := mockPush.getLastMessage()
 	require.Equal(t, "Agent has finished running.", msg.Body,
 		"push body should fall back when the final assistant text is empty")
 	require.Equal(t, int32(0), nonStreamingRequests.Load(),
 		"push summary should not be requested when final assistant text has no usable text")
+}
+
+func TestErroredChatClearsLastTurnSummaryAndSendsWebPush(t *testing.T) {
+	t.Parallel()
+
+	db, ps := dbtestutil.NewDB(t)
+	ctx := testutil.Context(t, testutil.WaitLong)
+
+	openAIURL := chattest.NewOpenAI(t, func(req *chattest.OpenAIRequest) chattest.OpenAIResponse {
+		if !req.Stream {
+			return chattest.OpenAINonStreamingResponse("title")
+		}
+		return chattest.OpenAIErrorResponse(http.StatusBadRequest, "invalid_request_error", "Bad request")
+	})
+
+	mockPush := &mockWebpushDispatcher{}
+
+	logger := slogtest.Make(t, &slogtest.Options{IgnoreErrors: true})
+	server := chatd.New(chatd.Config{
+		Logger:                     logger,
+		Database:                   db,
+		ReplicaID:                  uuid.New(),
+		Pubsub:                     ps,
+		PendingChatAcquireInterval: 10 * time.Millisecond,
+		InFlightChatStaleAfter:     testutil.WaitSuperLong,
+		WebpushDispatcher:          mockPush,
+	})
+	t.Cleanup(func() {
+		require.NoError(t, server.Close())
+	})
+
+	user, org, model := seedChatDependencies(t, db)
+	setOpenAIProviderBaseURL(ctx, t, db, openAIURL)
+
+	chat, err := server.CreateChat(ctx, chatd.CreateOptions{
+		OrganizationID:     org.ID,
+		OwnerID:            user.ID,
+		Title:              "error-summary-clear-test",
+		ModelConfigID:      model.ID,
+		InitialUserContent: []codersdk.ChatMessagePart{codersdk.ChatMessageText("do the thing")},
+	})
+	require.NoError(t, err)
+	seedLastTurnSummary(ctx, t, db, chat, "previous summary")
+
+	server.Start()
+
+	testutil.Eventually(ctx, t, func(ctx context.Context) bool {
+		fromDB, dbErr := db.GetChatByID(ctx, chat.ID)
+		return dbErr == nil &&
+			fromDB.Status == database.ChatStatusError &&
+			mockPush.dispatchCount.Load() >= 1
+	}, testutil.IntervalFast)
+	chatd.WaitUntilIdleForTest(server)
+
+	fromDB, err := db.GetChatByID(ctx, chat.ID)
+	require.NoError(t, err)
+	require.False(t, fromDB.LastTurnSummary.Valid,
+		"errored chats should clear cached turn summaries")
+
+	msg := mockPush.getLastMessage()
+	require.NotEqual(t, "Agent encountered an error.", msg.Body)
+	require.Contains(t, msg.Body, "OpenAI returned an unexpected error")
 }
 
 func TestComputerUseSubagentToolsAndModel(t *testing.T) {
@@ -6531,8 +6765,9 @@ func TestComputerUseSubagentToolsAndModel(t *testing.T) {
 	// computer use child chat). We use a raw HTTP handler because
 	// the chattest AnthropicRequest struct does not capture tools.
 	type anthropicCall struct {
-		Model string
-		Tools []string
+		Model  string
+		Tools  []string
+		Stream bool
 	}
 	var anthropicMu sync.Mutex
 	var anthropicCalls []anthropicCall
@@ -6563,8 +6798,9 @@ func TestComputerUseSubagentToolsAndModel(t *testing.T) {
 			}
 			anthropicMu.Lock()
 			anthropicCalls = append(anthropicCalls, anthropicCall{
-				Model: req.Model,
-				Tools: names,
+				Model:  req.Model,
+				Tools:  names,
+				Stream: req.Stream,
 			})
 			anthropicMu.Unlock()
 
@@ -6737,11 +6973,15 @@ func TestComputerUseSubagentToolsAndModel(t *testing.T) {
 			got.Status != database.ChatStatusError {
 			return false
 		}
-		// Ensure the Anthropic mock received at least one call.
+		// Ensure the Anthropic mock received the child streaming call.
 		anthropicMu.Lock()
-		n := len(anthropicCalls)
-		anthropicMu.Unlock()
-		return n >= 1
+		defer anthropicMu.Unlock()
+		for _, call := range anthropicCalls {
+			if call.Stream {
+				return true
+			}
+		}
+		return false
 	}, testutil.WaitLong, testutil.IntervalFast)
 
 	anthropicMu.Lock()
@@ -6751,8 +6991,18 @@ func TestComputerUseSubagentToolsAndModel(t *testing.T) {
 	require.NotEmpty(t, calls,
 		"expected at least one Anthropic LLM call")
 
-	childModel := calls[0].Model
-	childTools := calls[0].Tools
+	var childCall anthropicCall
+	for _, call := range calls {
+		if call.Stream {
+			childCall = call
+			break
+		}
+	}
+	require.True(t, childCall.Stream,
+		"expected at least one streaming Anthropic child LLM call")
+
+	childModel := childCall.Model
+	childTools := childCall.Tools
 
 	// 1. Verify the model is the computer use model.
 	require.Equal(t, computerUseModelName, childModel,

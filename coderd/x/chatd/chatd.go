@@ -67,6 +67,7 @@ const (
 	instructionCacheTTL          = 5 * time.Minute
 	workspaceDialValidationDelay = 5 * time.Second
 	workspaceMCPDiscoveryTimeout = 5 * time.Second
+	turnSummaryWriteTimeout      = 5 * time.Second
 	// defaultDialTimeout matches the timeout used by ~8 other
 	// server-side AgentConn callers.
 	defaultDialTimeout = 30 * time.Second
@@ -5509,12 +5510,21 @@ func (p *Server) processChat(ctx context.Context, chat database.Chat) {
 			})
 			p.publishChatActionRequired(finishResult.updatedChat, runResult.PendingDynamicToolCalls)
 		}
-		if !wasInterrupted {
+		if wasInterrupted {
+			p.maybeClearLastTurnSummaryAsync(cleanupCtx, finishResult.updatedChat, logger)
+		} else {
 			lastErrorMessage := ""
 			if lastErrorPayload != nil {
 				lastErrorMessage = lastErrorPayload.Message
 			}
-			p.maybeSendPushNotification(cleanupCtx, finishResult.updatedChat, status, lastErrorMessage, runResult, logger)
+			p.maybeFinalizeTurnSummaryAndPush(
+				cleanupCtx,
+				finishResult.updatedChat,
+				status,
+				lastErrorMessage,
+				runResult,
+				logger,
+			)
 		}
 	}()
 
@@ -5537,6 +5547,7 @@ func (p *Server) processChat(ctx context.Context, chat database.Chat) {
 			logger.Info(ctx, "chat canceled during shutdown; returning to pending")
 			status = database.ChatStatusPending
 			lastErrorPayload = nil
+			wasInterrupted = true
 			return
 		}
 		logger.Error(ctx, "failed to process chat", slog.Error(err))
@@ -5567,6 +5578,7 @@ func (p *Server) processChat(ctx context.Context, chat database.Chat) {
 		logger.Info(ctx, "chat completed during shutdown; returning to pending")
 		status = database.ChatStatusPending
 		lastErrorPayload = nil
+		wasInterrupted = true
 		return
 	}
 }
@@ -8251,12 +8263,9 @@ func parseDynamicToolNames(raw pqtype.NullRawMessage) (map[string]bool, error) {
 	return names, nil
 }
 
-// maybeSendPushNotification sends a web push notification when an
-// agent chat reaches a terminal state. For errors it dispatches
-// synchronously; for successful completions it spawns a goroutine
-// that generates a short LLM summary before dispatching. The caller
-// is responsible for skipping interrupted chats.
-func (p *Server) maybeSendPushNotification(
+// maybeFinalizeTurnSummaryAndPush updates the cached turn summary for
+// parent chats and optionally sends a web push notification.
+func (p *Server) maybeFinalizeTurnSummaryAndPush(
 	ctx context.Context,
 	chat database.Chat,
 	status database.ChatStatus,
@@ -8264,54 +8273,193 @@ func (p *Server) maybeSendPushNotification(
 	runResult runChatResult,
 	logger slog.Logger,
 ) {
-	if p.webpushDispatcher == nil || p.webpushDispatcher.PublicKey() == "" {
-		return
-	}
 	if chat.ParentChatID.Valid {
 		return
 	}
 
 	switch status {
-	case database.ChatStatusError:
-		pushBody := "Agent encountered an error."
-		if lastError != "" {
-			pushBody = lastError
-		}
-		p.dispatchPush(ctx, chat, pushBody, status, logger)
-
 	case database.ChatStatusWaiting:
-		// Generate a push notification summary asynchronously
-		// using a cheap LLM model. This avoids blocking the
-		// deferred cleanup path while still providing a
-		// meaningful notification body.
-		debugSvc := p.existingDebugService()
-		p.inflight.Add(1)
-		go func() {
-			defer p.inflight.Done()
-			pushCtx := context.WithoutCancel(ctx)
-			pushBody := "Agent has finished running."
-			assistantText := strings.TrimSpace(runResult.FinalAssistantText)
-			if assistantText != "" && runResult.PushSummaryModel != nil {
-				if summary := generatePushSummary(
-					pushCtx,
-					chat,
-					assistantText,
-					runResult.FallbackProvider,
-					runResult.FallbackModel,
-					runResult.PushSummaryModel,
-					runResult.ProviderKeys,
-					logger,
-					debugSvc,
-					runResult.TriggerMessageID,
-					runResult.HistoryTipMessageID,
-				); summary != "" {
-					pushBody = summary
-				}
-			}
+		p.finalizeSuccessfulTurnSummaryAndPush(ctx, chat, runResult, logger)
 
-			p.dispatchPush(pushCtx, chat, pushBody, status, logger)
-		}()
+	case database.ChatStatusPending:
+		p.finalizeSuccessfulTurnSummary(ctx, chat, runResult, logger)
+
+	case database.ChatStatusError:
+		p.clearLastTurnSummaryAsync(ctx, chat, logger)
+		if p.webpushConfigured() {
+			pushBody := "Agent encountered an error."
+			if lastError != "" {
+				pushBody = lastError
+			}
+			p.dispatchPush(ctx, chat, pushBody, status, logger)
+		}
+
+	case database.ChatStatusRequiresAction:
+		p.clearLastTurnSummaryAsync(ctx, chat, logger)
+
+	default:
+		// New statuses must be classified before they can safely
+		// preserve or finalize a cached turn summary.
+		p.clearLastTurnSummaryAsync(ctx, chat, logger)
 	}
+}
+
+func (p *Server) finalizeSuccessfulTurnSummary(
+	ctx context.Context,
+	chat database.Chat,
+	runResult runChatResult,
+	logger slog.Logger,
+) {
+	p.finalizeSuccessfulTurnSummaryWithAfterFunc(ctx, chat, runResult, logger, func(context.Context, string) {})
+}
+
+func (p *Server) finalizeSuccessfulTurnSummaryAndPush(
+	ctx context.Context,
+	chat database.Chat,
+	runResult runChatResult,
+	logger slog.Logger,
+) {
+	p.finalizeSuccessfulTurnSummaryWithAfterFunc(ctx, chat, runResult, logger, func(finalizeCtx context.Context, summary string) {
+		p.dispatchSuccessfulTurnPush(finalizeCtx, chat, summary, logger)
+	})
+}
+
+func (p *Server) finalizeSuccessfulTurnSummaryWithAfterFunc(
+	ctx context.Context,
+	chat database.Chat,
+	runResult runChatResult,
+	logger slog.Logger,
+	afterFinalize func(context.Context, string),
+) {
+	debugSvc := p.existingDebugService()
+	// This helper runs during processChat cleanup, while processChat is
+	// still counted in p.inflight. Do not take inflightMu here because
+	// drainInflight holds it while waiting.
+	p.inflight.Go(func() {
+		finalizeCtx := context.WithoutCancel(ctx)
+		summary := ""
+		assistantText := strings.TrimSpace(runResult.FinalAssistantText)
+		if assistantText != "" && runResult.PushSummaryModel != nil {
+			summary = strings.TrimSpace(generatePushSummary(
+				finalizeCtx,
+				chat,
+				assistantText,
+				runResult.FallbackProvider,
+				runResult.FallbackModel,
+				runResult.PushSummaryModel,
+				runResult.ProviderKeys,
+				logger,
+				debugSvc,
+				runResult.TriggerMessageID,
+				runResult.HistoryTipMessageID,
+			))
+		}
+
+		shouldPersistSummary := summary != "" || chat.LastTurnSummary.Valid
+		if shouldPersistSummary {
+			p.updateLastTurnSummary(finalizeCtx, chat, chat.UpdatedAt, summary, logger)
+		}
+
+		afterFinalize(finalizeCtx, summary)
+	})
+}
+
+func (p *Server) dispatchSuccessfulTurnPush(
+	ctx context.Context,
+	chat database.Chat,
+	summary string,
+	logger slog.Logger,
+) {
+	if !p.webpushConfigured() {
+		return
+	}
+	pushBody := "Agent has finished running."
+	if summary != "" {
+		pushBody = summary
+	}
+	p.dispatchPush(ctx, chat, pushBody, database.ChatStatusWaiting, logger)
+}
+
+func (p *Server) maybeClearLastTurnSummaryAsync(
+	ctx context.Context,
+	chat database.Chat,
+	logger slog.Logger,
+) {
+	if chat.ParentChatID.Valid {
+		return
+	}
+	p.clearLastTurnSummaryAsync(ctx, chat, logger)
+}
+
+func (p *Server) clearLastTurnSummaryAsync(
+	ctx context.Context,
+	chat database.Chat,
+	logger slog.Logger,
+) {
+	if !chat.LastTurnSummary.Valid {
+		return
+	}
+	// This helper runs during processChat cleanup, while processChat is
+	// still counted in p.inflight. Do not take inflightMu here because
+	// drainInflight holds it while waiting.
+	p.inflight.Go(func() {
+		p.updateLastTurnSummary(context.WithoutCancel(ctx), chat, chat.UpdatedAt, "", logger)
+	})
+}
+
+// updateLastTurnSummary writes the cached sidebar summary for a chat.
+// Callers should pass a detached context because this method is used for
+// best-effort background cache writes.
+func (p *Server) updateLastTurnSummary(
+	ctx context.Context,
+	chat database.Chat,
+	expectedUpdatedAt time.Time,
+	summary string,
+	logger slog.Logger,
+) {
+	summary = strings.TrimSpace(summary)
+	lastTurnSummary := sql.NullString{String: summary, Valid: summary != ""}
+
+	//nolint:gocritic // Narrow daemon access for best-effort summary cache writes.
+	updateCtx := dbauthz.AsChatd(ctx)
+	updateCtx, cancel := context.WithTimeout(updateCtx, turnSummaryWriteTimeout)
+	defer cancel()
+
+	affected, err := p.db.UpdateChatLastTurnSummary(updateCtx, database.UpdateChatLastTurnSummaryParams{
+		ID:                chat.ID,
+		ExpectedUpdatedAt: expectedUpdatedAt,
+		LastTurnSummary:   lastTurnSummary,
+	})
+	if err != nil {
+		logger.Warn(updateCtx, "failed to update chat turn summary",
+			slog.F("chat_id", chat.ID),
+			slog.Error(err),
+		)
+		return
+	}
+	if affected == 0 {
+		if summary != "" {
+			logger.Info(updateCtx, "skipped stale chat turn summary update with non-empty summary",
+				slog.F("chat_id", chat.ID),
+				slog.F("summary_length", len(summary)),
+				slog.F("expected_updated_at", expectedUpdatedAt),
+			)
+			return
+		}
+		logger.Debug(updateCtx, "skipped stale chat turn summary update",
+			slog.F("chat_id", chat.ID),
+			slog.F("expected_updated_at", expectedUpdatedAt),
+		)
+		return
+	}
+
+	updatedChat := chat
+	updatedChat.LastTurnSummary = lastTurnSummary
+	p.publishChatPubsubEvent(updatedChat, codersdk.ChatWatchEventKindSummaryChange, nil)
+}
+
+func (p *Server) webpushConfigured() bool {
+	return p.webpushDispatcher != nil && p.webpushDispatcher.PublicKey() != ""
 }
 
 func (p *Server) dispatchPush(
